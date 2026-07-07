@@ -85,7 +85,7 @@ pub trait RtpSender: Send + Sync + 'static {
     /// Returns the unique ID of the RTP sender.
     fn id(&self) -> RTCRtpSenderId;
     /// Returns the local track associated with this sender.
-    fn track(&self) -> &Arc<dyn TrackLocal>;
+    fn track(&self) -> Arc<dyn TrackLocal>;
     /// Returns the capabilities of the sender for the given codec kind.
     async fn get_capabilities(&self, kind: RtpCodecKind) -> Result<Option<RTCRtpCapabilities>>;
     /// Sets the parameters for this sender.
