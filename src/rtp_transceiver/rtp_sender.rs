@@ -9,7 +9,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 };
 use rtc::statistics::StatsSelector;
 use rtc::statistics::report::RTCStatsReport;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 /// Concrete async rtp sender implementation (generic over interceptor type).
@@ -25,7 +25,7 @@ where
     /// Inner PeerConnection Reference
     inner: Arc<PeerConnectionRef<I>>,
 
-    track: Arc<dyn TrackLocal>,
+    track: RwLock<Arc<dyn TrackLocal>>,
 }
 
 impl<I> RtpSenderImpl<I>
@@ -38,7 +38,11 @@ where
         inner: Arc<PeerConnectionRef<I>>,
         track: Arc<dyn TrackLocal>,
     ) -> Self {
-        Self { id, inner, track }
+        Self {
+            id,
+            inner,
+            track: RwLock::new(track),
+        }
     }
 }
 
@@ -51,8 +55,11 @@ where
         self.id
     }
 
-    fn track(&self) -> &Arc<dyn TrackLocal> {
-        &self.track
+    fn track(&self) -> Arc<dyn TrackLocal> {
+        self.track
+            .read()
+            .expect("rtp sender track lock poisoned")
+            .clone()
     }
 
     async fn get_capabilities(&self, kind: RtpCodecKind) -> Result<Option<RTCRtpCapabilities>> {
@@ -93,7 +100,32 @@ where
         peer_connection
             .rtp_sender(self.id)
             .ok_or(Error::ErrRTPSenderNotExisted)?
-            .replace_track(track.track().await)
+            .replace_track(track.track().await)?;
+
+        let old_track = {
+            let mut current = self.track.write().expect("rtp sender track lock poisoned");
+            let old = current.clone();
+            *current = track.clone();
+            old
+        };
+
+        old_track.unbind().await;
+        let rtp_parameters = peer_connection
+            .rtp_sender(self.id)
+            .ok_or(Error::ErrRTPSenderNotExisted)?
+            .get_parameters()
+            .rtp_parameters
+            .clone();
+
+        track
+            .bind(crate::media_stream::track_local::TrackLocalContext {
+                rtp_sender_id: self.id,
+                rtp_parameters,
+                driver_event_tx: self.inner.driver_event_tx.clone(),
+            })
+            .await;
+
+        Ok(())
     }
 
     async fn set_streams(&self, streams: Vec<MediaStreamId>) -> Result<()> {
