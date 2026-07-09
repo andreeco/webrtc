@@ -925,11 +925,6 @@ where
         writes
     }
 
-    async fn pending_internal_writes_len(inner: Arc<PeerConnectionRef<I>>) -> usize {
-        let core = inner.core.lock().await;
-        core.pending_internal_writes_len()
-    }
-
     async fn drain_core_events(inner: Arc<PeerConnectionRef<I>>) -> Vec<RTCPeerConnectionEvent> {
         let mut events = Vec::new();
         let mut core = inner.core.lock().await;
@@ -990,8 +985,9 @@ where
         }
 
         // 1.c peer_connection poll_write() - Send all outgoing packets
-        let pending_before = Self::pending_internal_writes_len(self.inner.clone()).await;
+        let mut wrote_core_packet = false;
         for msg in Self::drain_core_writes(self.inner.clone()).await {
+            wrote_core_packet = true;
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
             if let Err(err) = self.handle_write(msg).await {
                 error!(
@@ -1000,10 +996,8 @@ where
                 );
             }
         }
-        let pending_after = Self::pending_internal_writes_len(self.inner.clone()).await;
 
-        // Wake senders only when pending internal writes make forward progress.
-        if pending_after < pending_before {
+        if wrote_core_packet {
             self.inner.write_ready.notify_waiters();
         }
 
