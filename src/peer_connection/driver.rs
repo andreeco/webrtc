@@ -629,9 +629,31 @@ where
     async fn handle_rtc_message(&mut self, message: RTCMessage) {
         match message {
             RTCMessage::DataChannelMessage(channel_id, dc_message) => {
-                let data_channels = self.inner.data_channel_events_tx.lock().await;
-                if let Some(evt_tx) = data_channels.get(&channel_id) {
-                    if let Err(err) = evt_tx.try_send(DataChannelEvent::OnMessage(dc_message)) {
+                let detached_tx = {
+                    let detached = self.inner.detached_data_channel_rx_tx.lock().await;
+                    detached.get(&channel_id).cloned()
+                };
+
+                if let Some(detached_tx) = detached_tx {
+                    let message = crate::data_channel::DetachedDataChannelMessage {
+                        is_string: dc_message.is_string,
+                        data: dc_message.data,
+                    };
+                    if let Err(err) = detached_tx.send(message).await {
+                        error!(
+                            "Failed to send detached DataChannelMessage to data channel {}: {:?}",
+                            channel_id, err
+                        );
+                    }
+                    return;
+                }
+
+                let evt_tx = {
+                    let data_channels = self.inner.data_channel_events_tx.lock().await;
+                    data_channels.get(&channel_id).cloned()
+                };
+                if let Some(evt_tx) = evt_tx {
+                    if let Err(err) = evt_tx.send(DataChannelEvent::OnMessage(dc_message)).await {
                         error!(
                             "Failed to send DataChannelMessage to data channel {}: {:?}",
                             channel_id, err
@@ -819,6 +841,11 @@ where
         writes
     }
 
+    async fn pending_internal_writes_len(inner: Arc<PeerConnectionRef<I>>) -> usize {
+        let core = inner.core.lock().await;
+        core.pending_internal_writes_len()
+    }
+
     async fn drain_core_events(inner: Arc<PeerConnectionRef<I>>) -> Vec<RTCPeerConnectionEvent> {
         let mut events = Vec::new();
         let mut core = inner.core.lock().await;
@@ -879,6 +906,7 @@ where
         }
 
         // 1.c peer_connection poll_write() - Send all outgoing packets
+        let pending_before = Self::pending_internal_writes_len(self.inner.clone()).await;
         for msg in Self::drain_core_writes(self.inner.clone()).await {
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
             if let Err(err) = self.handle_write(msg).await {
@@ -888,8 +916,12 @@ where
                 );
             }
         }
+        let pending_after = Self::pending_internal_writes_len(self.inner.clone()).await;
 
-        self.inner.write_ready.notify_waiters();
+        // Wake senders only when pending internal writes make forward progress.
+        if pending_after < pending_before {
+            self.inner.write_ready.notify_waiters();
+        }
 
         Ok(())
     }
