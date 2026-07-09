@@ -45,11 +45,14 @@
 
 use crate::peer_connection::PeerConnectionRef;
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
-use crate::runtime::{Mutex, Receiver, timeout};
+use crate::runtime::{Mutex, Receiver, channel, timeout};
 use bytes::BytesMut;
 use rtc::interceptor::{Interceptor, NoopInterceptor};
 use rtc::shared::error::{Error, Result};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub use rtc::data_channel::{
     RTCDataChannelId, RTCDataChannelInit, RTCDataChannelMessage, RTCDataChannelState,
@@ -92,10 +95,32 @@ pub trait DataChannel: Send + Sync + 'static {
     async fn send_with_timeout(&self, data: BytesMut, timeout: Duration) -> Result<()>;
     /// Sends text data on this data channel.
     async fn send_text(&self, text: &str) -> Result<()>;
+    /// Detaches the channel into raw read/write mode with deadline support.
+    async fn detach_with_deadline(&self) -> Result<Arc<dyn DetachedDataChannel>>;
     /// Polls for the next event on this data channel.
     async fn poll(&self) -> Option<DataChannelEvent>;
     /// Closes the data channel.
     async fn close(&self) -> Result<()>;
+}
+
+/// Message read from a detached data channel.
+#[derive(Debug, Clone)]
+pub struct DetachedDataChannelMessage {
+    /// Whether the message should be interpreted as UTF-8 text.
+    pub is_string: bool,
+    /// Raw message payload.
+    pub data: BytesMut,
+}
+
+/// Detached data-channel API (Pion-style raw read/write with deadlines).
+#[async_trait::async_trait]
+pub trait DetachedDataChannel: Send + Sync + 'static {
+    /// Sets an absolute write deadline. `None` disables write deadlines.
+    async fn set_write_deadline(&self, deadline: Option<Instant>);
+    /// Writes one message to the data channel.
+    async fn write_data_channel(&self, data: BytesMut, is_string: bool) -> Result<usize>;
+    /// Reads one message from the data channel.
+    async fn read_data_channel(&self) -> Option<DetachedDataChannelMessage>;
 }
 
 /// Events that can occur on a [`DataChannel`].
@@ -193,14 +218,24 @@ where
         Ok(())
     }
 
-    async fn send_binary_with_retry(&self, data: BytesMut) -> Result<()> {
+    async fn send_message_with_retry(&self, data: BytesMut, is_string: bool) -> Result<()> {
         loop {
             let result = {
                 let mut peer_connection = self.inner.core.lock().await;
-                peer_connection
-                    .data_channel(self.id)
-                    .ok_or(Error::ErrDataChannelClosed)?
-                    .send(data.clone())
+                if is_string {
+                    let text = std::str::from_utf8(&data).map_err(|e| {
+                        Error::Other(format!("invalid utf8 detached/text payload: {e}"))
+                    })?;
+                    peer_connection
+                        .data_channel(self.id)
+                        .ok_or(Error::ErrDataChannelClosed)?
+                        .send_text(text)
+                } else {
+                    peer_connection
+                        .data_channel(self.id)
+                        .ok_or(Error::ErrDataChannelClosed)?
+                        .send(data.clone())
+                }
             };
 
             match result {
@@ -221,6 +256,128 @@ where
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+struct DetachedDataChannelImpl<I = NoopInterceptor>
+where
+    I: Interceptor,
+{
+    id: RTCDataChannelId,
+    inner: Arc<PeerConnectionRef<I>>,
+    read_rx: Mutex<Receiver<DetachedDataChannelMessage>>,
+    write_deadline: Mutex<Option<Instant>>,
+}
+
+impl<I> DetachedDataChannelImpl<I>
+where
+    I: Interceptor,
+{
+    fn new(
+        id: RTCDataChannelId,
+        inner: Arc<PeerConnectionRef<I>>,
+        read_rx: Receiver<DetachedDataChannelMessage>,
+    ) -> Self {
+        Self {
+            id,
+            inner,
+            read_rx: Mutex::new(read_rx),
+            write_deadline: Mutex::new(None),
+        }
+    }
+
+    async fn wait_for_write_ready(&self) -> Result<()> {
+        let notified = self.inner.write_ready.notified();
+        self.inner
+            .driver_event_tx
+            .send(PeerConnectionDriverEvent::WriteNotify)
+            .await
+            .map_err(|e| Error::Other(format!("{:?}", e)))?;
+        notified.await;
+        Ok(())
+    }
+
+    async fn send_message_with_retry(&self, data: BytesMut, is_string: bool) -> Result<()> {
+        loop {
+            let result = {
+                let mut peer_connection = self.inner.core.lock().await;
+                if is_string {
+                    let text = std::str::from_utf8(&data).map_err(|e| {
+                        Error::Other(format!("invalid utf8 detached/text payload: {e}"))
+                    })?;
+                    peer_connection
+                        .data_channel(self.id)
+                        .ok_or(Error::ErrDataChannelClosed)?
+                        .send_text(text)
+                } else {
+                    peer_connection
+                        .data_channel(self.id)
+                        .ok_or(Error::ErrDataChannelClosed)?
+                        .send(data.clone())
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    return self
+                        .inner
+                        .driver_event_tx
+                        .send(PeerConnectionDriverEvent::WriteNotify)
+                        .await
+                        .map_err(|e| Error::Other(format!("{:?}", e)));
+                }
+                Err(Error::ErrBufferFull) => {
+                    self.wait_for_write_ready().await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn write_with_configured_deadline(
+        &self,
+        data: BytesMut,
+        is_string: bool,
+    ) -> Result<usize> {
+        let configured_deadline = *self.write_deadline.lock().await;
+
+        if let Some(deadline) = configured_deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::ErrTimeout);
+            }
+            let timeout_duration = deadline.saturating_duration_since(now);
+            timeout(
+                timeout_duration,
+                self.send_message_with_retry(data.clone(), is_string),
+            )
+            .await
+            .map_err(|_| Error::ErrTimeout)??;
+            Ok(data.len())
+        } else {
+            self.send_message_with_retry(data.clone(), is_string)
+                .await?;
+            Ok(data.len())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<I> DetachedDataChannel for DetachedDataChannelImpl<I>
+where
+    I: Interceptor + 'static,
+{
+    async fn set_write_deadline(&self, deadline: Option<Instant>) {
+        *self.write_deadline.lock().await = deadline;
+    }
+
+    async fn write_data_channel(&self, data: BytesMut, is_string: bool) -> Result<usize> {
+        self.write_with_configured_deadline(data, is_string).await
+    }
+
+    async fn read_data_channel(&self) -> Option<DetachedDataChannelMessage> {
+        self.read_rx.lock().await.recv().await
     }
 }
 
@@ -385,11 +542,11 @@ where
     /// # }
     /// ```
     async fn send(&self, data: BytesMut) -> Result<()> {
-        self.send_binary_with_retry(data).await
+        self.send_message_with_retry(data, false).await
     }
 
     async fn send_with_timeout(&self, data: BytesMut, timeout_duration: Duration) -> Result<()> {
-        timeout(timeout_duration, self.send_binary_with_retry(data))
+        timeout(timeout_duration, self.send_message_with_retry(data, false))
             .await
             .map_err(|_| Error::ErrTimeout)?
     }
@@ -408,30 +565,39 @@ where
     /// # }
     /// ```
     async fn send_text(&self, text: &str) -> Result<()> {
-        loop {
-            let result = {
-                let mut peer_connection = self.inner.core.lock().await;
-                peer_connection
-                    .data_channel(self.id)
-                    .ok_or(Error::ErrDataChannelClosed)?
-                    .send_text(text)
-            };
+        self.send_message_with_retry(BytesMut::from(text.as_bytes()), true)
+            .await
+    }
 
-            match result {
-                Ok(()) => {
-                    return self
-                        .inner
-                        .driver_event_tx
-                        .send(PeerConnectionDriverEvent::WriteNotify)
-                        .await
-                        .map_err(|e| Error::Other(format!("{:?}", e)));
-                }
-                Err(Error::ErrBufferFull) => {
-                    self.wait_for_write_ready().await?;
-                }
-                Err(error) => return Err(error),
+    async fn detach_with_deadline(&self) -> Result<Arc<dyn DetachedDataChannel>> {
+        if !self.inner.data_channels_detached {
+            return Err(Error::ErrDetachNotEnabled);
+        }
+
+        {
+            let mut peer_connection = self.inner.core.lock().await;
+            let dc = peer_connection
+                .data_channel(self.id)
+                .ok_or(Error::ErrDataChannelClosed)?;
+            if dc.ready_state() != RTCDataChannelState::Open {
+                return Err(Error::ErrDetachBeforeOpened);
             }
         }
+
+        let mut detached_map = self.inner.detached_data_channel_rx_tx.lock().await;
+        if detached_map.contains_key(&self.id) {
+            return Err(Error::Other("data channel already detached".to_string()));
+        }
+
+        let (detached_tx, detached_rx) = channel(256);
+        detached_map.insert(self.id, detached_tx);
+        drop(detached_map);
+
+        Ok(Arc::new(DetachedDataChannelImpl::new(
+            self.id,
+            self.inner.clone(),
+            detached_rx,
+        )))
     }
 
     async fn poll(&self) -> Option<DataChannelEvent> {

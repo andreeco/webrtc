@@ -42,6 +42,12 @@ struct WebrtcHandler {
     runtime: Arc<dyn Runtime>,
 }
 
+struct CapturingWebrtcHandler {
+    gather_complete_tx: Sender<()>,
+    connected_tx: Sender<()>,
+    data_channel_tx: Sender<Arc<dyn DataChannel>>,
+}
+
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for WebrtcHandler {
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
@@ -83,10 +89,496 @@ impl PeerConnectionEventHandler for WebrtcHandler {
     }
 }
 
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for CapturingWebrtcHandler {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.gather_complete_tx.try_send(());
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: WebrtcPCState) {
+        if state == WebrtcPCState::Connected {
+            let _ = self.connected_tx.try_send(());
+        }
+    }
+
+    async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
+        let _ = self.data_channel_tx.try_send(dc);
+    }
+}
+
 /// Test data channels creation where RTC creates the channel, sends messages, and receives echoes
 #[test]
 fn test_data_channels_create_rtc_to_webrtc() {
     block_on(run_test()).unwrap();
+}
+
+#[test]
+fn test_data_channel_messages_are_backpressured_not_dropped_when_polling_is_delayed() {
+    block_on(run_delayed_polling_burst_test()).unwrap();
+}
+
+#[test]
+fn test_data_channel_detach_with_deadline_interop() {
+    block_on(run_detach_with_deadline_interop_test()).unwrap();
+}
+
+async fn run_detach_with_deadline_interop_test() -> Result<()> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .is_test(true)
+        .try_init()
+        .ok();
+
+    let runtime =
+        default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+    let (connected_tx, mut connected_rx) = channel::<()>(8);
+    let (data_channel_tx, mut data_channel_rx) = channel::<Arc<dyn DataChannel>>(1);
+
+    let std_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let local_addr = std_socket.local_addr()?;
+    let socket = runtime.wrap_udp_socket(std_socket)?;
+
+    let mut rtc_setting_engine = SettingEngine::default();
+    rtc_setting_engine.set_answering_dtls_role(RTCDtlsRole::Server)?;
+
+    let config = RTCConfigurationBuilder::new()
+        .with_ice_servers(vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }])
+        .build();
+
+    let mut rtc_pc = RTCPeerConnectionBuilder::new()
+        .with_configuration(config.clone())
+        .with_setting_engine(rtc_setting_engine)
+        .build()?;
+    let _rtc_dc = rtc_pc.create_data_channel("detached-channel", None)?;
+
+    let candidate = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: local_addr.ip().to_string(),
+            port: local_addr.port(),
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()?;
+    let local_candidate_init =
+        rtc::peer_connection::transport::RTCIceCandidate::from(&candidate).to_json()?;
+    rtc_pc.add_local_candidate(local_candidate_init)?;
+
+    let offer = rtc_pc.create_offer(None)?;
+    rtc_pc.set_local_description(offer.clone())?;
+
+    let handler = Arc::new(CapturingWebrtcHandler {
+        gather_complete_tx,
+        connected_tx,
+        data_channel_tx,
+    });
+    let mut webrtc_setting_engine = SettingEngine::default();
+    webrtc_setting_engine.detach_data_channels();
+    let webrtc_pc = PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_setting_engine(webrtc_setting_engine)
+        .with_handler(handler)
+        .with_runtime(runtime.clone())
+        .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+        .build()
+        .await?;
+
+    webrtc_pc.set_remote_description(offer).await?;
+    let answer = webrtc_pc.create_answer(None).await?;
+    webrtc_pc.set_local_description(answer.clone()).await?;
+    let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+
+    let answer_with_candidates = webrtc_pc
+        .local_description()
+        .await
+        .expect("local description should be set");
+    let rtc_answer = rtc::peer_connection::sdp::RTCSessionDescription::answer(
+        answer_with_candidates.sdp.clone(),
+    )?;
+    rtc_pc.set_remote_description(rtc_answer)?;
+
+    let mut buf = vec![0u8; 2000];
+    let mut rtc_connected = false;
+    let mut webrtc_connected = false;
+    let mut rtc_data_channel_opened = false;
+    let mut rtc_dc_id: Option<u16> = None;
+    let mut webrtc_dc: Option<Arc<dyn DataChannel>> = None;
+    let start_time = Instant::now();
+
+    while start_time.elapsed() < Duration::from_secs(30) {
+        while let Some(msg) = rtc_pc.poll_write() {
+            socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+
+        while let Some(event) = rtc_pc.poll_event() {
+            match event {
+                RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state)
+                    if state == RTCIceConnectionState::Failed =>
+                {
+                    return Err(anyhow::anyhow!("RTC ICE connection failed"));
+                }
+                RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
+                    if state == RTCPeerConnectionState::Failed {
+                        return Err(anyhow::anyhow!("RTC peer connection failed"));
+                    }
+                    if state == RTCPeerConnectionState::Connected {
+                        rtc_connected = true;
+                    }
+                }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(channel_id)) => {
+                    rtc_data_channel_opened = true;
+                    rtc_dc_id = Some(channel_id);
+                }
+                _ => {}
+            }
+        }
+
+        if !webrtc_connected && connected_rx.try_recv().is_ok() {
+            webrtc_connected = true;
+        }
+        if webrtc_dc.is_none()
+            && let Ok(dc) = data_channel_rx.try_recv()
+        {
+            webrtc_dc = Some(dc);
+        }
+
+        if rtc_connected && webrtc_connected && rtc_data_channel_opened && webrtc_dc.is_some() {
+            break;
+        }
+
+        let eto = rtc_pc
+            .poll_timeout()
+            .unwrap_or(Instant::now() + DEFAULT_TIMEOUT_DURATION);
+        let delay_from_now = eto
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_secs(0));
+
+        if delay_from_now.is_zero() {
+            rtc_pc.handle_timeout(Instant::now())?;
+            continue;
+        }
+
+        let timer = sleep(delay_from_now);
+        futures::select! {
+            _ = timer.fuse() => {
+                rtc_pc.handle_timeout(Instant::now())?;
+            }
+            res = socket.recv_from(&mut buf).fuse() => {
+                if let Ok((n, peer_addr)) = res {
+                    rtc_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr,
+                            peer_addr,
+                            ecn: None,
+                            transport_protocol: TransportProtocol::UDP,
+                        },
+                        message: BytesMut::from(&buf[..n]),
+                    })?;
+                }
+            }
+        }
+    }
+
+    let webrtc_dc = webrtc_dc.expect("webrtc data channel should be captured");
+    let detached = webrtc_dc.detach_with_deadline().await?;
+
+    detached
+        .set_write_deadline(Some(std::time::Instant::now() - Duration::from_millis(1)))
+        .await;
+    let timed_out = detached
+        .write_data_channel(BytesMut::from(&b"x"[..]), false)
+        .await
+        .expect_err("write should time out when deadline already expired");
+    assert!(matches!(timed_out, rtc::shared::error::Error::ErrTimeout));
+
+    let channel_id = rtc_dc_id.expect("RTC channel id should be set");
+    {
+        let mut dc = rtc_pc
+            .data_channel(channel_id)
+            .expect("RTC data channel should exist");
+        dc.send_text("detached-hello")?;
+    }
+
+    let mut detached_message: Option<String> = None;
+    let read_start = Instant::now();
+    while read_start.elapsed() < Duration::from_secs(10) {
+        while let Some(msg) = rtc_pc.poll_write() {
+            socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+
+        if let Ok(Some(message)) =
+            timeout(Duration::from_millis(10), detached.read_data_channel()).await
+        {
+            detached_message = Some(String::from_utf8(message.data.to_vec())?);
+            break;
+        }
+
+        let eto = rtc_pc
+            .poll_timeout()
+            .unwrap_or(Instant::now() + DEFAULT_TIMEOUT_DURATION);
+        let delay_from_now = eto
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_secs(0));
+
+        if delay_from_now.is_zero() {
+            rtc_pc.handle_timeout(Instant::now())?;
+            continue;
+        }
+
+        let timer = sleep(delay_from_now);
+        futures::select! {
+            _ = timer.fuse() => {
+                rtc_pc.handle_timeout(Instant::now())?;
+            }
+            res = socket.recv_from(&mut buf).fuse() => {
+                if let Ok((n, peer_addr)) = res {
+                    rtc_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext {
+                            local_addr,
+                            peer_addr,
+                            ecn: None,
+                            transport_protocol: TransportProtocol::UDP,
+                        },
+                        message: BytesMut::from(&buf[..n]),
+                    })?;
+                }
+            }
+        }
+    }
+
+    assert_eq!(detached_message.as_deref(), Some("detached-hello"));
+
+    webrtc_pc.close().await?;
+    rtc_pc.close()?;
+    Ok(())
+}
+
+async fn run_delayed_polling_burst_test() -> Result<()> {
+    const MESSAGE_COUNT: usize = 1_000;
+
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .is_test(true)
+        .try_init()
+        .ok();
+
+    let runtime =
+        default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
+    let (connected_tx, mut connected_rx) = channel::<()>(8);
+    let (data_channel_tx, mut data_channel_rx) = channel::<Arc<dyn DataChannel>>(1);
+
+    let std_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let local_addr = std_socket.local_addr()?;
+    let socket = runtime.wrap_udp_socket(std_socket)?;
+
+    let mut setting_engine = SettingEngine::default();
+    setting_engine.set_answering_dtls_role(RTCDtlsRole::Server)?;
+
+    let config = RTCConfigurationBuilder::new()
+        .with_ice_servers(vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }])
+        .build();
+
+    let mut rtc_pc = RTCPeerConnectionBuilder::new()
+        .with_configuration(config.clone())
+        .with_setting_engine(setting_engine)
+        .build()?;
+    let _rtc_dc = rtc_pc.create_data_channel("burst-channel", None)?;
+
+    let candidate = CandidateHostConfig {
+        base_config: CandidateConfig {
+            network: "udp".to_owned(),
+            address: local_addr.ip().to_string(),
+            port: local_addr.port(),
+            component: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .new_candidate_host()?;
+    let local_candidate_init =
+        rtc::peer_connection::transport::RTCIceCandidate::from(&candidate).to_json()?;
+    rtc_pc.add_local_candidate(local_candidate_init)?;
+
+    let offer = rtc_pc.create_offer(None)?;
+    rtc_pc.set_local_description(offer.clone())?;
+
+    let handler = Arc::new(CapturingWebrtcHandler {
+        gather_complete_tx,
+        connected_tx,
+        data_channel_tx,
+    });
+    let webrtc_pc = PeerConnectionBuilder::new()
+        .with_configuration(config)
+        .with_handler(handler)
+        .with_runtime(runtime.clone())
+        .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
+        .build()
+        .await?;
+
+    webrtc_pc.set_remote_description(offer).await?;
+    let answer = webrtc_pc.create_answer(None).await?;
+    webrtc_pc.set_local_description(answer.clone()).await?;
+    let _ = timeout(Duration::from_secs(5), gather_complete_rx.recv()).await;
+
+    let answer_with_candidates = webrtc_pc
+        .local_description()
+        .await
+        .expect("local description should be set");
+    let rtc_answer = rtc::peer_connection::sdp::RTCSessionDescription::answer(
+        answer_with_candidates.sdp.clone(),
+    )?;
+    rtc_pc.set_remote_description(rtc_answer)?;
+
+    let mut buf = vec![0u8; 2000];
+    let mut rtc_connected = false;
+    let mut webrtc_connected = false;
+    let mut rtc_data_channel_opened = false;
+    let mut rtc_dc_id: Option<u16> = None;
+    let mut webrtc_dc: Option<Arc<dyn DataChannel>> = None;
+    let mut sent_burst = false;
+    let mut poll_after: Option<Instant> = None;
+    let mut received = Vec::new();
+    let start_time = Instant::now();
+
+    while start_time.elapsed() < Duration::from_secs(30) {
+        while let Some(msg) = rtc_pc.poll_write() {
+            socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+
+        while let Some(event) = rtc_pc.poll_event() {
+            match event {
+                RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state)
+                    if state == RTCIceConnectionState::Failed =>
+                {
+                    return Err(anyhow::anyhow!("RTC ICE connection failed"));
+                }
+                RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
+                    if state == RTCPeerConnectionState::Failed {
+                        return Err(anyhow::anyhow!("RTC peer connection failed"));
+                    }
+                    if state == RTCPeerConnectionState::Connected {
+                        rtc_connected = true;
+                    }
+                }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(channel_id)) => {
+                    rtc_data_channel_opened = true;
+                    rtc_dc_id = Some(channel_id);
+                }
+                _ => {}
+            }
+        }
+
+        if !webrtc_connected && connected_rx.try_recv().is_ok() {
+            webrtc_connected = true;
+        }
+        if webrtc_dc.is_none()
+            && let Ok(dc) = data_channel_rx.try_recv()
+        {
+            webrtc_dc = Some(dc);
+        }
+
+        if rtc_connected
+            && webrtc_connected
+            && rtc_data_channel_opened
+            && webrtc_dc.is_some()
+            && !sent_burst
+        {
+            let channel_id = rtc_dc_id.expect("RTC channel id should be set");
+            for i in 0..MESSAGE_COUNT {
+                let mut dc = rtc_pc
+                    .data_channel(channel_id)
+                    .expect("RTC data channel should exist");
+                dc.send_text(format!("burst-{i:03}"))?;
+            }
+            sent_burst = true;
+            poll_after = Some(Instant::now() + Duration::from_millis(750));
+        }
+
+        if sent_burst
+            && poll_after.is_some_and(|deadline| Instant::now() >= deadline)
+            && let Some(dc) = webrtc_dc.as_ref()
+        {
+            while let Ok(Some(event)) = timeout(Duration::from_millis(1), dc.poll()).await {
+                match event {
+                    DataChannelEvent::OnMessage(message) => {
+                        received.push(String::from_utf8(message.data.to_vec())?);
+                        if received.len() == MESSAGE_COUNT {
+                            for (i, message) in received.iter().enumerate() {
+                                assert_eq!(message, &format!("burst-{i:03}"));
+                            }
+                            webrtc_pc.close().await?;
+                            rtc_pc.close()?;
+                            return Ok(());
+                        }
+                    }
+                    DataChannelEvent::OnClose => break,
+                    _ => {}
+                }
+            }
+        }
+
+        let eto = rtc_pc
+            .poll_timeout()
+            .unwrap_or(Instant::now() + DEFAULT_TIMEOUT_DURATION);
+        let delay_from_now = eto
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_secs(0));
+        if delay_from_now.is_zero() {
+            rtc_pc.handle_timeout(Instant::now())?;
+            continue;
+        }
+
+        let timer = sleep(delay_from_now.min(Duration::from_millis(5)));
+        futures::select! {
+            _ = timer.fuse() => {
+                rtc_pc.handle_timeout(Instant::now())?;
+            }
+            res = socket.recv_from(&mut buf).fuse() => {
+                match res {
+                    Ok((n, peer_addr)) => {
+                        rtc_pc.handle_read(TaggedBytesMut {
+                            now: Instant::now(),
+                            transport: TransportContext {
+                                local_addr,
+                                peer_addr,
+                                ecn: None,
+                                transport_protocol: TransportProtocol::UDP,
+                            },
+                            message: BytesMut::from(&buf[..n]),
+                        })?;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "delayed polling burst timed out after receiving {}/{} messages",
+        received.len(),
+        MESSAGE_COUNT
+    ))
 }
 
 async fn run_test() -> Result<()> {

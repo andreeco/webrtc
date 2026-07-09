@@ -58,7 +58,9 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::data_channel::{DataChannel, DataChannelEvent, DataChannelImpl};
+use crate::data_channel::{
+    DataChannel, DataChannelEvent, DataChannelImpl, DetachedDataChannelMessage,
+};
 use crate::media_stream::{track_local::TrackLocal, track_remote::TrackRemote};
 use crate::rtp_transceiver::{RtpReceiver, RtpSender, RtpTransceiver, RtpTransceiverImpl};
 use crate::runtime::{JoinHandle, Runtime, default_runtime};
@@ -173,6 +175,7 @@ where
     runtime: Option<Arc<dyn Runtime>>,
     handler: Option<Arc<dyn PeerConnectionEventHandler>>,
     mdns_mode: MulticastDnsMode,
+    data_channels_detached: bool,
     udp_addrs: Vec<A>,
     tcp_addrs: Vec<A>,
     dedicated_reactor: bool,
@@ -185,6 +188,7 @@ impl<A: ToSocketAddrs> Default for PeerConnectionBuilder<A, NoopInterceptor> {
             runtime: None,
             handler: None,
             mdns_mode: MulticastDnsMode::Disabled,
+            data_channels_detached: false,
             udp_addrs: vec![],
             tcp_addrs: vec![],
             dedicated_reactor: false,
@@ -218,6 +222,7 @@ where
     /// Configures the builder with the specified [`SettingEngine`].
     pub fn with_setting_engine(mut self, setting_engine: SettingEngine) -> Self {
         self.mdns_mode = setting_engine.multicast_dns().mode;
+        self.data_channels_detached = setting_engine.data_channels_detached();
         self.builder = self.builder.with_setting_engine(setting_engine);
         self
     }
@@ -235,6 +240,7 @@ where
             runtime: self.runtime,
             handler: self.handler,
             mdns_mode: self.mdns_mode,
+            data_channels_detached: self.data_channels_detached,
             udp_addrs: self.udp_addrs,
             tcp_addrs: self.tcp_addrs,
             dedicated_reactor: self.dedicated_reactor,
@@ -305,6 +311,7 @@ where
             self.handler
                 .ok_or_else(|| std::io::Error::other("no event handler found"))?,
             self.mdns_mode,
+            self.data_channels_detached,
             self.udp_addrs,
             self.tcp_addrs,
             self.dedicated_reactor,
@@ -448,8 +455,13 @@ where
     pub(crate) closing: AtomicBool,
     /// Notifies timed data-channel senders after pending writes are polled.
     pub(crate) write_ready: Notify,
+    /// Whether detached data-channel mode is enabled for this peer connection.
+    pub(crate) data_channels_detached: bool,
     /// Channels for incoming data channel events
     pub(crate) data_channel_events_tx: Mutex<HashMap<RTCDataChannelId, Sender<DataChannelEvent>>>,
+    /// Channels for detached data channel message delivery.
+    pub(crate) detached_data_channel_rx_tx:
+        Mutex<HashMap<RTCDataChannelId, Sender<DetachedDataChannelMessage>>>,
     /// Channels for incoming track remote events
     #[allow(clippy::type_complexity)]
     pub(crate) track_remote_events_tx:
@@ -509,6 +521,7 @@ where
         runtime: Arc<dyn Runtime>,
         handler: Arc<dyn PeerConnectionEventHandler>,
         mdns_mode: MulticastDnsMode,
+        data_channels_detached: bool,
         udp_addrs: Vec<A>,
         tcp_addrs: Vec<A>,
         dedicated_reactor: bool,
@@ -552,6 +565,7 @@ where
                 core: Mutex::new(core),
                 runtime: runtime.clone(),
                 data_channel_events_tx: Mutex::new(HashMap::new()),
+                detached_data_channel_rx_tx: Mutex::new(HashMap::new()),
                 track_remote_events_tx: Mutex::new(HashMap::new()),
                 track_local_events_tx: Mutex::new(HashMap::new()),
                 rtp_transceivers: Mutex::new(HashMap::new()),
@@ -561,6 +575,7 @@ where
                 write_backpressure: std::sync::atomic::AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
                 write_ready: Notify::default(),
+                data_channels_detached,
             }),
             driver_handle: Mutex::new(None),
             dedicated_reactor,
