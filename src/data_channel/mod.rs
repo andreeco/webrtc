@@ -81,6 +81,8 @@ pub trait DataChannel: Send + Sync + 'static {
     fn id(&self) -> RTCDataChannelId;
     /// Returns the current state of this data channel.
     async fn ready_state(&self) -> Result<RTCDataChannelState>;
+    /// Returns the current buffered outbound amount in bytes.
+    async fn buffered_amount(&self) -> Result<u64>;
     /// Returns the buffered amount high threshold in bytes.
     async fn buffered_amount_high_threshold(&self) -> Result<u32>;
     /// Sets the buffered amount high threshold in bytes.
@@ -319,12 +321,8 @@ where
 
             match result {
                 Ok(()) => {
-                    return self
-                        .inner
-                        .driver_event_tx
-                        .send(PeerConnectionDriverEvent::WriteNotify)
-                        .await
-                        .map_err(|e| Error::Other(format!("{:?}", e)));
+                    self.wait_for_write_ready().await?;
+                    return Ok(());
                 }
                 Err(Error::ErrBufferFull) => {
                     self.wait_for_write_ready().await?;
@@ -467,6 +465,15 @@ where
             .data_channel(self.id)
             .ok_or(Error::ErrDataChannelClosed)?
             .ready_state())
+    }
+
+    /// buffered_amount returns the number of bytes currently queued for outbound delivery.
+    async fn buffered_amount(&self) -> Result<u64> {
+        let mut peer_connection = self.inner.core.lock().await;
+        Ok(peer_connection
+            .data_channel(self.id)
+            .ok_or(Error::ErrDataChannelClosed)?
+            .buffered_amount())
     }
 
     /// buffered_amount_high_threshold represents the threshold at which the
