@@ -44,11 +44,11 @@
 //! ```
 
 use crate::peer_connection::PeerConnectionRef;
-use crate::runtime::{Mutex, Receiver};
+use crate::runtime::{Mutex, Receiver, timeout};
 use bytes::BytesMut;
 use rtc::interceptor::{Interceptor, NoopInterceptor};
 use rtc::shared::error::{Error, Result};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
 pub use rtc::data_channel::{
@@ -88,6 +88,8 @@ pub trait DataChannel: Send + Sync + 'static {
     async fn set_buffered_amount_low_threshold(&self, threshold: u32) -> Result<()>;
     /// Sends raw binary data on this data channel.
     async fn send(&self, data: BytesMut) -> Result<()>;
+    /// Sends raw binary data, waiting up to `timeout` for SCTP backpressure to clear.
+    async fn send_with_timeout(&self, data: BytesMut, timeout: Duration) -> Result<()>;
     /// Sends text data on this data channel.
     async fn send_text(&self, text: &str) -> Result<()>;
     /// Polls for the next event on this data channel.
@@ -168,16 +170,56 @@ impl<I> DataChannelImpl<I>
 where
     I: Interceptor,
 {
-    /// Create a new data channel wrapper
     pub(crate) fn new(
         id: RTCDataChannelId,
         inner: Arc<PeerConnectionRef<I>>,
-        evt_rx: Receiver<DataChannelEvent>,
+        event_rx: Receiver<DataChannelEvent>,
     ) -> Self {
         Self {
             id,
             inner,
-            evt_rx: Mutex::new(evt_rx),
+            evt_rx: Mutex::new(event_rx),
+        }
+    }
+
+    async fn wait_for_write_ready(&self) -> Result<()> {
+        let notified = self.inner.write_ready.notified();
+        self.inner
+            .driver_event_tx
+            .send(PeerConnectionDriverEvent::WriteNotify)
+            .await
+            .map_err(|e| Error::Other(format!("{:?}", e)))?;
+        notified.await;
+        Ok(())
+    }
+
+    async fn send_binary_with_retry(&self, data: BytesMut) -> Result<()> {
+        loop {
+            let result = {
+                let mut peer_connection = self.inner.core.lock().await;
+                peer_connection
+                    .data_channel(self.id)
+                    .ok_or(Error::ErrDataChannelClosed)?
+                    .send(data.clone())
+            };
+
+            match result {
+                Ok(()) => {
+                    // Wake the driver so it flushes SCTP output (poll_write) and checks
+                    // for newly generated events (e.g. OnBufferedAmountHigh).
+                    return self
+                        .inner
+                        .driver_event_tx
+                        .send(PeerConnectionDriverEvent::WriteNotify)
+                        .await
+                        .map_err(|e| Error::Other(format!("{:?}", e)));
+                }
+                Err(Error::ErrBufferFull) => {
+                    self.wait_for_write_ready().await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -349,21 +391,13 @@ where
     /// # }
     /// ```
     async fn send(&self, data: BytesMut) -> Result<()> {
-        {
-            let mut peer_connection = self.inner.core.lock().await;
-            peer_connection
-                .data_channel(self.id)
-                .ok_or(Error::ErrDataChannelClosed)?
-                .send(data)?;
-        }
+        self.send_binary_with_retry(data).await
+    }
 
-        // Wake the driver so it flushes SCTP output (poll_write) and checks
-        // for newly generated events (e.g. OnBufferedAmountHigh).
-        self.inner
-            .driver_event_tx
-            .send(PeerConnectionDriverEvent::WriteNotify)
+    async fn send_with_timeout(&self, data: BytesMut, timeout_duration: Duration) -> Result<()> {
+        timeout(timeout_duration, self.send_binary_with_retry(data))
             .await
-            .map_err(|e| Error::Other(format!("{:?}", e)))
+            .map_err(|_| Error::ErrTimeout)?
     }
 
     /// Send text data
@@ -380,19 +414,32 @@ where
     /// # }
     /// ```
     async fn send_text(&self, text: &str) -> Result<()> {
-        {
-            let mut peer_connection = self.inner.core.lock().await;
-            peer_connection
-                .data_channel(self.id)
-                .ok_or(Error::ErrDataChannelClosed)?
-                .send_text(text)?;
-        }
+        loop {
+            let result = {
+                let mut peer_connection = self.inner.core.lock().await;
+                peer_connection
+                    .data_channel(self.id)
+                    .ok_or(Error::ErrDataChannelClosed)?
+                    .send_text(text)
+            };
 
-        self.inner
-            .driver_event_tx
-            .send(PeerConnectionDriverEvent::WriteNotify)
-            .await
-            .map_err(|e| Error::Other(format!("{:?}", e)))
+            match result {
+                Ok(()) => {
+                    // Wake the driver so it flushes SCTP output.
+                    return self
+                        .inner
+                        .driver_event_tx
+                        .send(PeerConnectionDriverEvent::WriteNotify)
+                        .await
+                        .map_err(|e| Error::Other(format!("{:?}", e)));
+                }
+                Err(Error::ErrBufferFull) => {
+                    self.wait_for_write_ready().await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn poll(&self) -> Option<DataChannelEvent> {

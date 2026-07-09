@@ -62,7 +62,7 @@ use crate::data_channel::{DataChannel, DataChannelEvent, DataChannelImpl};
 use crate::media_stream::{track_local::TrackLocal, track_remote::TrackRemote};
 use crate::rtp_transceiver::{RtpReceiver, RtpSender, RtpTransceiver, RtpTransceiverImpl};
 use crate::runtime::{JoinHandle, Runtime, default_runtime};
-use crate::runtime::{Mutex, Sender, channel};
+use crate::runtime::{Mutex, Notify, Sender, channel};
 
 use driver::{
     DATA_CHANNEL_EVENT_CHANNEL_CAPACITY, PEER_CONNECTION_DRIVER_EVENT_CHANNEL_CAPACITY,
@@ -405,6 +405,8 @@ where
     pub(crate) rtp_transceivers: Mutex<HashMap<RTCRtpTransceiverId, Arc<RtpTransceiverImpl<I>>>>,
     /// Unified channel for all outgoing driver events
     pub(crate) driver_event_tx: Sender<PeerConnectionDriverEvent>,
+    /// Notifies senders after the driver has polled pending writes.
+    pub(crate) write_ready: Notify,
     /// Channels for incoming data channel events
     pub(crate) data_channel_events_tx: Mutex<HashMap<RTCDataChannelId, Sender<DataChannelEvent>>>,
     /// Channels for incoming track remote events
@@ -466,6 +468,7 @@ where
                 rtp_transceivers: Mutex::new(HashMap::new()),
                 handler,
                 driver_event_tx,
+                write_ready: Notify::default(),
             }),
             driver_handle: Mutex::new(None),
         };
