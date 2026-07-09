@@ -299,30 +299,47 @@ where
         Ok(())
     }
 
+    async fn current_buffered_amount(&self) -> Result<u64> {
+        let mut peer_connection = self.inner.core.lock().await;
+        Ok(peer_connection
+            .data_channel(self.id)
+            .ok_or(Error::ErrDataChannelClosed)?
+            .buffered_amount())
+    }
+
     async fn send_message_with_retry(&self, data: BytesMut, is_string: bool) -> Result<()> {
         loop {
-            let result = {
+            let (result, buffered_before, buffered_after_enqueue) = {
                 let mut peer_connection = self.inner.core.lock().await;
-                if is_string {
+                let mut channel = peer_connection
+                    .data_channel(self.id)
+                    .ok_or(Error::ErrDataChannelClosed)?;
+                let buffered_before = channel.buffered_amount();
+                let result = if is_string {
                     let text = std::str::from_utf8(&data).map_err(|e| {
                         Error::Other(format!("invalid utf8 detached/text payload: {e}"))
                     })?;
-                    peer_connection
-                        .data_channel(self.id)
-                        .ok_or(Error::ErrDataChannelClosed)?
-                        .send_text(text)
+                    channel.send_text(text)
                 } else {
-                    peer_connection
-                        .data_channel(self.id)
-                        .ok_or(Error::ErrDataChannelClosed)?
-                        .send(data.clone())
-                }
+                    channel.send(data.clone())
+                };
+                let buffered_after_enqueue = channel.buffered_amount();
+                (result, buffered_before, buffered_after_enqueue)
             };
 
             match result {
                 Ok(()) => {
-                    self.wait_for_write_ready().await?;
-                    return Ok(());
+                    if buffered_after_enqueue <= buffered_before {
+                        return Ok(());
+                    }
+
+                    loop {
+                        self.wait_for_write_ready().await?;
+                        let buffered_now = self.current_buffered_amount().await?;
+                        if buffered_now < buffered_after_enqueue {
+                            return Ok(());
+                        }
+                    }
                 }
                 Err(Error::ErrBufferFull) => {
                     self.wait_for_write_ready().await?;
