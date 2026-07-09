@@ -973,6 +973,8 @@ where
             }
         }
 
+        self.inner.write_ready.notify_waiters();
+
         Ok(())
     }
 

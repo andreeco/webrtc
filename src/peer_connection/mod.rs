@@ -62,7 +62,7 @@ use crate::data_channel::{DataChannel, DataChannelEvent, DataChannelImpl};
 use crate::media_stream::{track_local::TrackLocal, track_remote::TrackRemote};
 use crate::rtp_transceiver::{RtpReceiver, RtpSender, RtpTransceiver, RtpTransceiverImpl};
 use crate::runtime::{JoinHandle, Runtime, default_runtime};
-use crate::runtime::{Mutex, Sender, channel};
+use crate::runtime::{Mutex, Notify, Sender, channel};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use driver::{
@@ -441,24 +441,13 @@ where
     /// Unified channel for all outgoing driver events
     pub(crate) driver_event_tx: Sender<PeerConnectionDriverEvent>,
     /// Coalescing write-flush gate (pion `awakeWriteLoop` equivalent).
-    ///
-    /// Hot-path senders (`dc.send`, etc.) set this flag and, only on the
-    /// `false -> true` transition, drop a single non-blocking `WriteNotify` onto
-    /// `driver_event_tx`. The driver clears the flag at the top of every loop
-    /// iteration before draining core writes, so a burst of N sends produces at
-    /// most one driver wake — replacing the old per-message
-    /// `driver_event_tx.send(WriteNotify).await` (one blocking send per message).
     pub(crate) write_pending: AtomicBool,
-    /// Counts coalesced sends (driver already behind) to drive a periodic
-    /// cooperative yield — see [`PeerConnectionRef::wake_writes`].
+    /// Counts coalesced sends while the driver is already behind.
     pub(crate) write_backpressure: std::sync::atomic::AtomicUsize,
-    /// Shutdown flag set by `close()`/`Drop`. The driver checks it at the top of
-    /// every loop iteration, so the event loop — and thus a dedicated reactor
-    /// thread — terminates even when the accompanying best-effort `Close` wake
-    /// could not be enqueued (a momentarily full channel). This is the guarantee
-    /// that closes the reactor-thread leak window; the `Close` event is only the
-    /// fast wake.
+    /// Shutdown flag for the driver reactor.
     pub(crate) closing: AtomicBool,
+    /// Notifies timed data-channel senders after pending writes are polled.
+    pub(crate) write_ready: Notify,
     /// Channels for incoming data channel events
     pub(crate) data_channel_events_tx: Mutex<HashMap<RTCDataChannelId, Sender<DataChannelEvent>>>,
     /// Channels for incoming track remote events
@@ -571,6 +560,7 @@ where
                 write_pending: AtomicBool::new(false),
                 write_backpressure: std::sync::atomic::AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
+                write_ready: Notify::default(),
             }),
             driver_handle: Mutex::new(None),
             dedicated_reactor,
