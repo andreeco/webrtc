@@ -46,6 +46,7 @@
 use crate::peer_connection::PeerConnectionRef;
 use crate::runtime::{Mutex, Receiver, channel, timeout};
 use bytes::BytesMut;
+use log::debug;
 use rtc::interceptor::{Interceptor, NoopInterceptor};
 use rtc::shared::error::{Error, Result};
 use std::{
@@ -336,7 +337,16 @@ where
                         .map_err(|e| Error::Other(format!("{:?}", e)));
                 }
                 Err(Error::ErrBufferFull) => {
+                    debug!(
+                        "detached_data_channel_write_buffer_full_waiting id={:?} bytes={}",
+                        self.id,
+                        data.len()
+                    );
                     self.wait_for_write_ready().await?;
+                    debug!(
+                        "detached_data_channel_write_woke_for_retry id={:?}",
+                        self.id
+                    );
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -386,7 +396,21 @@ where
     }
 
     async fn read_data_channel(&self) -> Option<DetachedDataChannelMessage> {
-        self.read_rx.lock().await.recv().await
+        let slow_sub_debug = std::env::var("OXIDESFU_QUEUE_DEBUG")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if slow_sub_debug {
+            eprintln!("[detached-read-debug] wait channel={}", self.id);
+        }
+        let message = self.read_rx.lock().await.recv().await;
+        if slow_sub_debug {
+            eprintln!(
+                "[detached-read-debug] received channel={} bytes={}",
+                self.id,
+                message.as_ref().map_or(0, |message| message.data.len())
+            );
+        }
+        message
     }
 }
 
@@ -625,7 +649,36 @@ where
     }
 
     async fn poll(&self) -> Option<DataChannelEvent> {
-        self.evt_rx.lock().await.recv().await
+        let queue_debug = std::env::var("OXIDESFU_EVENT_READ_DEBUG")
+            .ok()
+            .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if queue_debug {
+            eprintln!(
+                "[event-read-debug] peer={:p} wait channel={}",
+                Arc::as_ptr(&self.inner),
+                self.id
+            );
+        }
+        let event = self.evt_rx.lock().await.recv().await;
+        if queue_debug {
+            eprintln!(
+                "[event-read-debug] peer={:p} received channel={} kind={}",
+                Arc::as_ptr(&self.inner),
+                self.id,
+                match event.as_ref() {
+                    Some(DataChannelEvent::OnMessage(message)) => {
+                        if message.data.as_ref() == b"seed" {
+                            "seed"
+                        } else {
+                            "message"
+                        }
+                    }
+                    Some(_) => "state",
+                    None => "closed",
+                }
+            );
+        }
+        event
     }
 
     async fn close(&self) -> Result<()> {
