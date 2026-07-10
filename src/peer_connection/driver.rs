@@ -723,13 +723,10 @@ where
                 payload_type,
             } => {
                 let mut core = self.inner.core.lock().await;
-                if let Some(sender) = core.rtp_sender(sender_id) {
+                if core.rtp_sender(sender_id).is_some() {
                     packet.header.ssrc = ssrc;
                     packet.header.payload_type = payload_type;
-                    let track_id = sender.track().track_id().to_string();
-                    if let Err(err) = core.handle_write(
-                        rtc::peer_connection::message::RTCMessage::RtpPacket(track_id, packet),
-                    ) {
+                    if let Err(err) = core.write_rtp_packet(packet) {
                         error!("Failed to send prepared RTP: {}", err);
                     }
                 } else {
