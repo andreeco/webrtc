@@ -309,37 +309,31 @@ where
 
     async fn send_message_with_retry(&self, data: BytesMut, is_string: bool) -> Result<()> {
         loop {
-            let (result, buffered_before, buffered_after_enqueue) = {
+            let result = {
                 let mut peer_connection = self.inner.core.lock().await;
                 let mut channel = peer_connection
                     .data_channel(self.id)
                     .ok_or(Error::ErrDataChannelClosed)?;
-                let buffered_before = channel.buffered_amount();
-                let result = if is_string {
+                if is_string {
                     let text = std::str::from_utf8(&data).map_err(|e| {
                         Error::Other(format!("invalid utf8 detached/text payload: {e}"))
                     })?;
                     channel.send_text(text)
                 } else {
                     channel.send(data.clone())
-                };
-                let buffered_after_enqueue = channel.buffered_amount();
-                (result, buffered_before, buffered_after_enqueue)
+                }
             };
 
             match result {
                 Ok(()) => {
-                    if buffered_after_enqueue <= buffered_before {
-                        return Ok(());
-                    }
-
-                    loop {
-                        self.wait_for_write_ready().await?;
-                        let buffered_now = self.current_buffered_amount().await?;
-                        if buffered_now < buffered_after_enqueue {
-                            return Ok(());
-                        }
-                    }
+                    // Match detached writer semantics from upstream/pion:
+                    // return once data is accepted into SCTP, do not wait for full drain.
+                    return self
+                        .inner
+                        .driver_event_tx
+                        .send(PeerConnectionDriverEvent::WriteNotify)
+                        .await
+                        .map_err(|e| Error::Other(format!("{:?}", e)));
                 }
                 Err(Error::ErrBufferFull) => {
                     self.wait_for_write_ready().await?;
