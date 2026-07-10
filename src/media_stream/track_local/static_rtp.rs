@@ -95,8 +95,23 @@ impl TrackLocalStaticRTP {
     /// marshalling/allocation when only MID needs to be injected.
     pub async fn write_rtp_with_sdes_mid(
         &self,
-        mut pkt: rtp::Packet,
+        pkt: rtp::Packet,
         mid: &[u8],
+        preserve_existing_extensions: bool,
+    ) -> Result<()> {
+        self.write_rtp_with_sdes_mid_bytes(
+            pkt,
+            Bytes::copy_from_slice(mid),
+            preserve_existing_extensions,
+        )
+        .await
+    }
+
+    /// Writes an RTP packet with SDES MID extension using a reusable MID byte buffer.
+    pub async fn write_rtp_with_sdes_mid_bytes(
+        &self,
+        mut pkt: rtp::Packet,
+        mid: Bytes,
         preserve_existing_extensions: bool,
     ) -> Result<()> {
         if !preserve_existing_extensions {
@@ -127,7 +142,7 @@ impl TrackLocalStaticRTP {
 
         if let Some(id) = mid_ext_id {
             pkt.header
-                .set_extension(id, Bytes::copy_from_slice(mid))
+                .set_extension(id, mid)
                 .map_err(|e| Error::Other(format!("{:?}", e)))?;
         }
 
