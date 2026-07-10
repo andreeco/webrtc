@@ -106,7 +106,7 @@ impl TrackLocalStaticRTP {
             pkt.header.extensions_padding = 0;
         }
 
-        let (tx, rtp_sender_id, mid_ext_id) = {
+        let (tx, rtp_sender_id, mid_ext_id, prepared_rtp) = {
             let ctx = self.ctx.lock().await;
             let Some(ctx) = &*ctx else {
                 return Err(Error::ErrBindFailed);
@@ -117,7 +117,12 @@ impl TrackLocalStaticRTP {
                 .iter()
                 .find(|ext| ext.uri == SDES_MID_URI)
                 .map(|ext| ext.id as u8);
-            (ctx.driver_event_tx.clone(), ctx.rtp_sender_id, mid_ext_id)
+            (
+                ctx.driver_event_tx.clone(),
+                ctx.rtp_sender_id,
+                mid_ext_id,
+                ctx.prepared_rtp.clone(),
+            )
         };
 
         if let Some(id) = mid_ext_id {
@@ -126,7 +131,18 @@ impl TrackLocalStaticRTP {
                 .map_err(|e| Error::Other(format!("{:?}", e)))?;
         }
 
-        tx.send(PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, pkt))
+        let event = if let Some(prepared) = prepared_rtp {
+            PeerConnectionDriverEvent::SenderRtpPrepared {
+                sender_id: prepared.rtp_sender_id,
+                packet: pkt,
+                ssrc: prepared.ssrc,
+                payload_type: prepared.payload_type,
+            }
+        } else {
+            PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, pkt)
+        };
+
+        tx.send(event)
             .await
             .map_err(|e| Error::Other(format!("{:?}", e)))
     }
@@ -252,8 +268,19 @@ impl TrackLocal for TrackLocalStaticRTP {
         if let Some(ctx) = &*ctx_opt {
             let tx = ctx.driver_event_tx.clone();
             let rtp_sender_id = ctx.rtp_sender_id;
+            let prepared_rtp = ctx.prepared_rtp.clone();
             drop(ctx_opt);
-            tx.send(PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, packet))
+            let event = if let Some(prepared) = prepared_rtp {
+                PeerConnectionDriverEvent::SenderRtpPrepared {
+                    sender_id: prepared.rtp_sender_id,
+                    packet,
+                    ssrc: prepared.ssrc,
+                    payload_type: prepared.payload_type,
+                }
+            } else {
+                PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, packet)
+            };
+            tx.send(event)
                 .await
                 .map_err(|e| Error::Other(format!("{:?}", e)))
         } else {

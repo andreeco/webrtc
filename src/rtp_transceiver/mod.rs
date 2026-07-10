@@ -170,6 +170,11 @@ where
                 .track()
                 .bind(TrackLocalContext {
                     rtp_sender_id: self.id.into(),
+                    prepared_rtp: TrackLocalContext::build_prepared_rtp(
+                        self.id.into(),
+                        &params.rtp_parameters,
+                        &params.encodings,
+                    ),
                     rtp_parameters: params.rtp_parameters,
                     driver_event_tx: self.inner.driver_event_tx.clone(),
                 })

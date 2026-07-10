@@ -29,7 +29,7 @@ use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, R
 use rtc::peer_connection::message::RTCMessage;
 use rtc::peer_connection::state::RTCIceGatheringState;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
-use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
+use rtc::rtp_transceiver::{PayloadType, RTCRtpReceiverId, RTCRtpSenderId, SSRC};
 use rtc::sansio::Protocol;
 use rtc::shared::error::{Error, Result};
 use rtc::shared::{FourTuple, TaggedBytesMut, TransportContext, TransportProtocol};
@@ -56,6 +56,12 @@ const UDP_RECV_BUF_LEN: usize = 2000;
 #[derive(Debug)]
 pub(crate) enum PeerConnectionDriverEvent {
     SenderRtp(RTCRtpSenderId, rtp::Packet),
+    SenderRtpPrepared {
+        sender_id: RTCRtpSenderId,
+        packet: rtp::Packet,
+        ssrc: SSRC,
+        payload_type: PayloadType,
+    },
     SenderRtcp(RTCRtpSenderId, Vec<Box<dyn rtcp::Packet>>),
     ReceiverRtcp(RTCRtpReceiverId, Vec<Box<dyn rtcp::Packet>>),
     RemoteIceTcpPassiveCandidate(Candidate),
@@ -706,6 +712,29 @@ where
                 } else {
                     error!(
                         "Failed to send RTP due to unknown sender id {:?}",
+                        sender_id
+                    );
+                }
+            }
+            PeerConnectionDriverEvent::SenderRtpPrepared {
+                sender_id,
+                mut packet,
+                ssrc,
+                payload_type,
+            } => {
+                let mut core = self.inner.core.lock().await;
+                if let Some(sender) = core.rtp_sender(sender_id) {
+                    packet.header.ssrc = ssrc;
+                    packet.header.payload_type = payload_type;
+                    let track_id = sender.track().track_id().to_string();
+                    if let Err(err) = core.handle_write(
+                        rtc::peer_connection::message::RTCMessage::RtpPacket(track_id, packet),
+                    ) {
+                        error!("Failed to send prepared RTP: {}", err);
+                    }
+                } else {
+                    error!(
+                        "Failed to send prepared RTP due to unknown sender id {:?}",
                         sender_id
                     );
                 }
