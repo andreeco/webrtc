@@ -3,7 +3,7 @@ use crate::media_stream::Track;
 use crate::media_stream::track_local::{TrackLocal, TrackLocalContext};
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
 use crate::runtime::Mutex;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rtc::media_stream::{
     MediaStreamId, MediaStreamTrack, MediaStreamTrackId, MediaStreamTrackState,
     MediaTrackCapabilities, MediaTrackConstraints, MediaTrackSettings,
@@ -14,6 +14,8 @@ use rtc::shared::error::flatten_errs;
 use rtc::shared::marshal::{Marshal, MarshalSize};
 use rtc::{rtcp, rtp};
 use std::collections::HashMap;
+
+const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 
 /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
 /// If you wish to send a media.Sample use TrackLocalStaticSample
@@ -85,6 +87,48 @@ impl TrackLocalStaticRTP {
         }
 
         flatten_errs(write_errs)
+    }
+
+    /// Writes an RTP packet with SDES MID extension set to the negotiated MID extension ID.
+    ///
+    /// This is a fast path used in SFU forwarding to avoid per-packet extension trait-object
+    /// marshalling/allocation when only MID needs to be injected.
+    pub async fn write_rtp_with_sdes_mid(
+        &self,
+        mut pkt: rtp::Packet,
+        mid: &[u8],
+        preserve_existing_extensions: bool,
+    ) -> Result<()> {
+        if !preserve_existing_extensions {
+            pkt.header.extension = false;
+            pkt.header.extension_profile = 0;
+            pkt.header.extensions.clear();
+            pkt.header.extensions_padding = 0;
+        }
+
+        let (tx, rtp_sender_id, mid_ext_id) = {
+            let ctx = self.ctx.lock().await;
+            let Some(ctx) = &*ctx else {
+                return Err(Error::ErrBindFailed);
+            };
+            let mid_ext_id = ctx
+                .rtp_parameters
+                .header_extensions
+                .iter()
+                .find(|ext| ext.uri == SDES_MID_URI)
+                .map(|ext| ext.id as u8);
+            (ctx.driver_event_tx.clone(), ctx.rtp_sender_id, mid_ext_id)
+        };
+
+        if let Some(id) = mid_ext_id {
+            pkt.header
+                .set_extension(id, Bytes::copy_from_slice(mid))
+                .map_err(|e| Error::Other(format!("{:?}", e)))?;
+        }
+
+        tx.send(PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, pkt))
+            .await
+            .map_err(|e| Error::Other(format!("{:?}", e)))
     }
 }
 
