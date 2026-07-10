@@ -242,8 +242,6 @@ where
 
             match result {
                 Ok(()) => {
-                    // Wake the driver so it flushes SCTP output (poll_write) and checks
-                    // for newly generated events (e.g. OnBufferedAmountHigh).
                     return self
                         .inner
                         .driver_event_tx
@@ -253,7 +251,6 @@ where
                 }
                 Err(Error::ErrBufferFull) => {
                     self.wait_for_write_ready().await?;
-                    continue;
                 }
                 Err(error) => return Err(error),
             }
