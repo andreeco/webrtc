@@ -723,16 +723,12 @@ where
                 payload_type,
             } => {
                 let mut core = self.inner.core.lock().await;
-                if core.rtp_sender(sender_id).is_some() {
-                    packet.header.ssrc = ssrc;
-                    packet.header.payload_type = payload_type;
-                    if let Err(err) = core.write_rtp_packet(packet) {
-                        error!("Failed to send prepared RTP: {}", err);
-                    }
-                } else {
+                packet.header.ssrc = ssrc;
+                packet.header.payload_type = payload_type;
+                if let Err(err) = core.write_rtp_packet(packet) {
                     error!(
-                        "Failed to send prepared RTP due to unknown sender id {:?}",
-                        sender_id
+                        "Failed to send prepared RTP for sender {:?}: {}",
+                        sender_id, err
                     );
                 }
             }
