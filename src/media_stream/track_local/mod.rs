@@ -47,8 +47,8 @@ use crate::media_stream::Track;
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
 use crate::runtime::{Receiver, Sender};
 use rtc::media_stream::MediaStreamTrack;
-use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::rtp_transceiver::rtp_sender::RTCRtpParameters;
+use rtc::rtp_transceiver::{PayloadType, RTCRtpSenderId, SSRC};
 use rtc::{rtcp, rtp};
 
 /// Events that can occur on a [`TrackLocal`] (a track we send).
@@ -67,11 +67,39 @@ pub mod static_sample;
 
 /// TrackLocalContext is the Context passed when a TrackLocal has been Binded/Unbinded from a PeerConnection, and used
 /// in Interceptors.
+/// Pre-resolved RTP sender values for hot-path packet forwarding.
+#[derive(Clone)]
+pub struct PreparedTrackLocalRtpContext {
+    pub(crate) rtp_sender_id: RTCRtpSenderId,
+    pub(crate) ssrc: SSRC,
+    pub(crate) payload_type: PayloadType,
+}
+
+/// Context passed to a bound local track with negotiated sender state.
 #[derive(Clone)]
 pub struct TrackLocalContext {
     pub(crate) rtp_sender_id: RTCRtpSenderId,
     pub(crate) rtp_parameters: RTCRtpParameters,
     pub(crate) driver_event_tx: Sender<PeerConnectionDriverEvent>,
+    pub(crate) prepared_rtp: Option<PreparedTrackLocalRtpContext>,
+}
+
+impl TrackLocalContext {
+    pub(crate) fn build_prepared_rtp(
+        rtp_sender_id: RTCRtpSenderId,
+        rtp_parameters: &RTCRtpParameters,
+        codings: &[rtc::rtp_transceiver::rtp_sender::RTCRtpEncodingParameters],
+    ) -> Option<PreparedTrackLocalRtpContext> {
+        let first_coding = codings.first()?;
+        let ssrc = first_coding.rtp_coding_parameters.ssrc?;
+        let payload_type = rtp_parameters.codecs.first()?.payload_type;
+
+        Some(PreparedTrackLocalRtpContext {
+            rtp_sender_id,
+            ssrc,
+            payload_type,
+        })
+    }
 }
 
 /// A local media track that can be sent to a remote peer.

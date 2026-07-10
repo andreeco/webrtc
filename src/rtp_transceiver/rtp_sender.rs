@@ -110,16 +110,23 @@ where
         };
 
         old_track.unbind().await;
-        let rtp_parameters = peer_connection
-            .rtp_sender(self.id)
-            .ok_or(Error::ErrRTPSenderNotExisted)?
-            .get_parameters()
-            .rtp_parameters
-            .clone();
+        let (rtp_parameters, encodings) = {
+            let mut sender = peer_connection
+                .rtp_sender(self.id)
+                .ok_or(Error::ErrRTPSenderNotExisted)?;
+            let params = sender.get_parameters();
+            (params.rtp_parameters.clone(), params.encodings.clone())
+        };
 
         track
             .bind(crate::media_stream::track_local::TrackLocalContext {
                 rtp_sender_id: self.id,
+                prepared_rtp:
+                    crate::media_stream::track_local::TrackLocalContext::build_prepared_rtp(
+                        self.id,
+                        &rtp_parameters,
+                        &encodings,
+                    ),
                 rtp_parameters,
                 driver_event_tx: self.inner.driver_event_tx.clone(),
             })
