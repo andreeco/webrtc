@@ -332,6 +332,36 @@ impl TokioNotify {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::TokioNotify;
+
+    #[tokio::test]
+    async fn notify_one_retains_a_write_ready_permit_for_a_later_waiter() {
+        let notify = TokioNotify::new();
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_millis(50), notify.notified())
+            .await
+            .expect("notify_one should retain a readiness permit");
+    }
+
+    #[tokio::test]
+    async fn notify_waiters_does_not_retain_a_write_ready_permit() {
+        let notify = TokioNotify::new();
+        notify.notify_waiters();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), notify.notified())
+                .await
+                .is_err(),
+            "notify_waiters intentionally loses notifications with no registered waiter"
+        );
+    }
+}
+
 impl AsyncNotify for TokioNotify {
     fn notify_one(&self) {
         self.0.notify_one();

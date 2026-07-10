@@ -20,7 +20,7 @@ use bytes::BytesMut;
 use futures::FutureExt; // For .fuse() in futures::select!
 use futures::future::OptionFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{error, trace, warn};
+use log::{debug, error, trace, warn};
 use rtc::ice::candidate::Candidate;
 use rtc::interceptor::{Interceptor, NoopInterceptor};
 use rtc::mdns::MDNS_PORT;
@@ -90,6 +90,9 @@ where
     ice_gathering_active: bool,
     stun_gathering_complete: bool,
     turn_gathering_complete: bool,
+    detached_data_channel_send_counts: HashMap<rtc::data_channel::RTCDataChannelId, u64>,
+    data_channel_event_send_counts: HashMap<rtc::data_channel::RTCDataChannelId, u64>,
+    event_send_recovered: bool,
 }
 
 impl<I> PeerConnectionDriver<I>
@@ -119,6 +122,9 @@ where
             ice_gathering_active: false,
             stun_gathering_complete: false,
             turn_gathering_complete: false,
+            detached_data_channel_send_counts: HashMap::new(),
+            data_channel_event_send_counts: HashMap::new(),
+            event_send_recovered: false,
         })
     }
 
@@ -700,11 +706,38 @@ where
                         is_string: dc_message.is_string,
                         data: dc_message.data,
                     };
-                    if let Err(err) = detached_tx.send(message).await {
-                        error!(
-                            "Failed to send detached DataChannelMessage to data channel {}: {:?}",
-                            channel_id, err
+                    let send_count = self
+                        .detached_data_channel_send_counts
+                        .entry(channel_id)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    let slow_sub_debug = std::env::var("OXIDESFU_QUEUE_DEBUG")
+                        .ok()
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+                    if slow_sub_debug && *send_count % 64 == 1 {
+                        eprintln!(
+                            "[driver-data-debug] detached-send-start channel={channel_id} count={send_count} bytes={}",
+                            message.data.len()
                         );
+                    }
+                    let started_at = Instant::now();
+                    match detached_tx.send(message).await {
+                        Ok(())
+                            if slow_sub_debug
+                                && started_at.elapsed() >= Duration::from_millis(1) =>
+                        {
+                            eprintln!(
+                                "[driver-data-debug] detached-send-unblocked channel={channel_id} count={send_count} blocked_ms={}",
+                                started_at.elapsed().as_millis()
+                            );
+                        }
+                        Ok(()) => {}
+                        Err(err) => {
+                            error!(
+                                "Failed to send detached DataChannelMessage to data channel {}: {:?}",
+                                channel_id, err
+                            );
+                        }
                     }
                     return;
                 }
@@ -714,11 +747,47 @@ where
                     data_channels.get(&channel_id).cloned()
                 };
                 if let Some(evt_tx) = evt_tx {
-                    if let Err(err) = evt_tx.send(DataChannelEvent::OnMessage(dc_message)).await {
-                        error!(
-                            "Failed to send DataChannelMessage to data channel {}: {:?}",
-                            channel_id, err
+                    let data_len = dc_message.data.len();
+                    let send_count = self
+                        .data_channel_event_send_counts
+                        .entry(channel_id)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    let queue_debug = std::env::var("OXIDESFU_QUEUE_DEBUG")
+                        .ok()
+                        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+                    if queue_debug && (*send_count % 64 == 1 || (60..=70).contains(send_count)) {
+                        eprintln!(
+                            "[driver-data-debug] peer={:p} event-send-start channel={channel_id} count={send_count} bytes={data_len}",
+                            Arc::as_ptr(&self.inner)
                         );
+                    }
+                    let started_at = Instant::now();
+                    match evt_tx.send(DataChannelEvent::OnMessage(dc_message)).await {
+                        Ok(())
+                            if queue_debug && started_at.elapsed() >= Duration::from_millis(1) =>
+                        {
+                            eprintln!(
+                                "[driver-data-debug] peer={:p} event-send-unblocked channel={channel_id} count={send_count} blocked_ms={}",
+                                Arc::as_ptr(&self.inner),
+                                started_at.elapsed().as_millis()
+                            );
+                            self.event_send_recovered = true;
+                        }
+                        Ok(()) => {
+                            if queue_debug && (60..=70).contains(send_count) {
+                                eprintln!(
+                                    "[driver-data-debug] peer={:p} event-send-complete channel={channel_id} count={send_count}",
+                                    Arc::as_ptr(&self.inner)
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            error!(
+                                "Failed to send DataChannelMessage to data channel {}: {:?}",
+                                channel_id, err
+                            );
+                        }
                     }
                 } else {
                     error!(
@@ -1020,7 +1089,19 @@ where
         }
 
         if wrote_core_packet {
+            debug!("peer_connection_driver_core_write_ready");
             self.inner.write_ready.notify_waiters();
+        }
+        if self.event_send_recovered {
+            let queue_debug = std::env::var("OXIDESFU_QUEUE_DEBUG")
+                .ok()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            if queue_debug {
+                eprintln!(
+                    "[driver-data-debug] poll-writes-after-event-recovery wrote_core_packet={wrote_core_packet}"
+                );
+            }
+            self.event_send_recovered = false;
         }
 
         Ok(())
