@@ -166,6 +166,27 @@ fn test_peer_connection_statistics() {
             }
         }
 
+        // Channels created after SCTP is established must emit DCEP without requiring
+        // an application data write to wake the peer-connection driver.
+        let late_dc = offerer
+            .create_data_channel("late-stats-dc", None)
+            .await
+            .expect("late data channel should create");
+        let late_answer_dc = timeout(Duration::from_secs(5), dc_rx.recv())
+            .await
+            .expect("answerer should observe late data channel")
+            .expect("answerer data channel event stream should stay open");
+        assert_eq!(late_answer_dc.label().await.unwrap(), "late-stats-dc");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(DataChannelEvent::OnOpen) = late_dc.poll().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("late data channel should open without an application write");
+
         // Wait a brief moment for statistics to settle
         sleep(Duration::from_millis(100)).await;
 
@@ -180,17 +201,19 @@ fn test_peer_connection_statistics() {
         let pc_stats = offerer_stats
             .peer_connection()
             .expect("PeerConnection stats missing");
-        assert_eq!(pc_stats.data_channels_opened, 1);
+        assert_eq!(pc_stats.data_channels_opened, 2);
 
         // Verify DataChannel stats
         let dc_stats_list: Vec<_> = offerer_stats.data_channels().collect();
         assert_eq!(
             dc_stats_list.len(),
-            1,
-            "Expected 1 data channel stats entry"
+            2,
+            "Expected statistics for both initial and late data channels"
         );
-        let dc_stats = dc_stats_list[0];
-        assert_eq!(dc_stats.label, "stats-dc");
+        let dc_stats = dc_stats_list
+            .iter()
+            .find(|stats| stats.label == "stats-dc")
+            .expect("initial data channel stats missing");
         assert!(dc_stats.messages_sent > 0, "Expected messages_sent > 0");
 
         // Verify Transport stats
@@ -215,7 +238,7 @@ fn test_peer_connection_statistics() {
         let ans_pc_stats = answerer_stats
             .peer_connection()
             .expect("Answerer PeerConnection stats missing");
-        assert_eq!(ans_pc_stats.data_channels_opened, 1);
+        assert_eq!(ans_pc_stats.data_channels_opened, 2);
 
         // Close peer connections
         offerer.close().await.unwrap();
