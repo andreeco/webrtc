@@ -15,6 +15,7 @@ use rtc::peer_connection::configuration::media_engine::MIME_TYPE_VP8;
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
+use rtc::statistics::StatsSelector;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -266,6 +267,25 @@ async fn run_test() -> anyhow::Result<()> {
     assert!(
         answerer_track_open_count.load(Ordering::SeqCst) > 0,
         "media-only negotiation should open a remote track"
+    );
+
+    let offerer_stats = offerer.get_stats(Instant::now(), StatsSelector::None).await;
+    assert!(
+        offerer_stats.outbound_rtp_streams().any(|stream| {
+            stream.sent_rtp_stream_stats.packets_sent > 0
+                && stream.sent_rtp_stream_stats.bytes_sent > 0
+        }),
+        "RTP sender should report non-zero outbound packet and byte counts"
+    );
+
+    let answerer_stats = answerer
+        .get_stats(Instant::now(), StatsSelector::None)
+        .await;
+    assert!(
+        answerer_stats.inbound_rtp_streams().any(|stream| {
+            stream.received_rtp_stream_stats.packets_received > 0 && stream.bytes_received > 0
+        }),
+        "RTP receiver should report non-zero inbound packet and byte counts"
     );
 
     assert_eq!(
