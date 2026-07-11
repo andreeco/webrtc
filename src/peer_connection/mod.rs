@@ -688,6 +688,14 @@ where
             data_channels.insert(channel_id, evt_tx);
         }
 
+        // A late-created channel queues its DCEP open message in the core. Wake
+        // the driver so it polls that message without waiting for a data write.
+        self.inner
+            .driver_event_tx
+            .send(PeerConnectionDriverEvent::WriteNotify)
+            .await
+            .map_err(|error| Error::Other(format!("{error:?}")))?;
+
         Ok(Arc::new(DataChannelImpl::new(
             channel_id,
             self.inner.clone(),
