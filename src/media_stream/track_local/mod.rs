@@ -83,13 +83,87 @@ impl TrackLocalContext {
     ) -> Option<PreparedTrackLocalRtpContext> {
         let first_coding = codings.first()?;
         let ssrc = first_coding.rtp_coding_parameters.ssrc?;
-        let payload_type = rtp_parameters.codecs.first()?.payload_type;
+        let payload_type = rtp_parameters
+            .codecs
+            .iter()
+            .find(|codec| {
+                codec
+                    .rtp_codec
+                    .mime_type
+                    .eq_ignore_ascii_case(&first_coding.codec.mime_type)
+                    && codec.rtp_codec.clock_rate == first_coding.codec.clock_rate
+                    && codec.rtp_codec.channels == first_coding.codec.channels
+                    && codec.rtp_codec.sdp_fmtp_line == first_coding.codec.sdp_fmtp_line
+            })
+            .or_else(|| {
+                rtp_parameters.codecs.iter().find(|codec| {
+                    codec
+                        .rtp_codec
+                        .mime_type
+                        .eq_ignore_ascii_case(&first_coding.codec.mime_type)
+                })
+            })
+            .or_else(|| rtp_parameters.codecs.first())?
+            .payload_type;
 
         Some(PreparedTrackLocalRtpContext {
             rtp_sender_id,
             ssrc,
             payload_type,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackLocalContext;
+    use rtc::rtp_transceiver::RTCRtpSenderId;
+    use rtc::rtp_transceiver::rtp_sender::{
+        RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
+        RTCRtpParameters,
+    };
+
+    fn codec(mime_type: &str) -> RTCRtpCodec {
+        RTCRtpCodec {
+            mime_type: mime_type.to_string(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: String::new(),
+            rtcp_feedback: vec![],
+        }
+    }
+
+    #[test]
+    fn prepared_rtp_uses_the_local_encoding_codec_payload_type() {
+        let parameters = RTCRtpParameters {
+            codecs: vec![
+                RTCRtpCodecParameters {
+                    rtp_codec: codec("video/h264"),
+                    payload_type: 125,
+                    ..Default::default()
+                },
+                RTCRtpCodecParameters {
+                    rtp_codec: codec("video/vp8"),
+                    payload_type: 96,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let codings = vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(1234),
+                ..Default::default()
+            },
+            codec: codec("video/vp8"),
+            ..Default::default()
+        }];
+
+        let prepared =
+            TrackLocalContext::build_prepared_rtp(RTCRtpSenderId::default(), &parameters, &codings)
+                .expect("prepared RTP context should be available");
+
+        assert_eq!(prepared.payload_type, 96);
     }
 }
 
