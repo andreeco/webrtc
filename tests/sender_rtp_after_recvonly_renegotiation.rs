@@ -19,7 +19,7 @@ use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
-    RTCIceGatheringState, RTCPeerConnectionState,
+    RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription,
 };
 use webrtc::runtime::{Runtime, Sender, block_on, channel, default_runtime, sleep, timeout};
 
@@ -123,6 +123,18 @@ async fn wait_for_packets(counter: &Arc<AtomicUsize>, at_least: usize) -> anyhow
 #[test]
 fn sender_rtp_survives_recvonly_renegotiation() {
     block_on(run_test()).expect("RTP should continue after recvonly renegotiation");
+}
+
+#[test]
+fn sender_rtp_survives_single_pc_style_multi_section_renegotiations() {
+    block_on(run_single_pc_style_multi_section_test())
+        .expect("RTP should continue through single-PC style recvonly growth renegotiations");
+}
+
+#[test]
+fn sender_rtp_survives_when_answer_sets_publish_mid_recvonly() {
+    block_on(run_answer_recvonly_publish_mid_test())
+        .expect("offerer should continue sending when answer marks publish MID recvonly");
 }
 
 async fn run_test() -> anyhow::Result<()> {
@@ -276,6 +288,417 @@ async fn run_test() -> anyhow::Result<()> {
                         sequence_number: seq,
                         timestamp: u32::from(seq) * 960,
                         ssrc: 0x4455_6677,
+                        ..Default::default()
+                    },
+                    payload: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                },
+                sender_mid.as_bytes(),
+                false,
+            )
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_packets(&receiver_packets, before + 5).await?;
+
+    offerer.close().await?;
+    answerer.close().await?;
+    Ok(())
+}
+
+fn rewrite_mid_direction(sdp: &str, mid: &str, direction: &str) -> String {
+    let mut output = String::new();
+    let mut current_is_target = false;
+
+    for line in sdp.split("\r\n") {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("m=") {
+            current_is_target = false;
+            output.push_str(line);
+            output.push_str("\r\n");
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=mid:") {
+            current_is_target = value == mid;
+            output.push_str(line);
+            output.push_str("\r\n");
+            continue;
+        }
+        if current_is_target
+            && (line == "a=sendrecv"
+                || line == "a=sendonly"
+                || line == "a=recvonly"
+                || line == "a=inactive")
+        {
+            output.push_str("a=");
+            output.push_str(direction);
+            output.push_str("\r\n");
+            continue;
+        }
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+
+    output
+}
+
+async fn run_single_pc_style_multi_section_test() -> anyhow::Result<()> {
+    let runtime = default_runtime().ok_or_else(|| std::io::Error::other("no runtime"))?;
+    let mut media = MediaEngine::default();
+    media.register_default_codecs()?;
+
+    let receiver_packets = Arc::new(AtomicUsize::new(0));
+    let (offer_gather_tx, mut offer_gather_rx) = channel(1);
+    let (answer_gather_tx, mut answer_gather_rx) = channel(1);
+    let (offer_connected_tx, mut offer_connected_rx) = channel(1);
+    let (answer_connected_tx, mut answer_connected_rx) = channel(1);
+
+    let offerer: Arc<dyn PeerConnection> = Arc::new(
+        PeerConnectionBuilder::new()
+            .with_media_engine(media.clone())
+            .with_handler(Arc::new(TestHandler {
+                gathered_tx: offer_gather_tx,
+                connected_tx: offer_connected_tx,
+                packets_rx: None,
+                runtime: runtime.clone(),
+            }))
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
+            .build()
+            .await?,
+    );
+
+    let answerer: Arc<dyn PeerConnection> = Arc::new(
+        PeerConnectionBuilder::new()
+            .with_media_engine(media)
+            .with_handler(Arc::new(TestHandler {
+                gathered_tx: answer_gather_tx,
+                connected_tx: answer_connected_tx,
+                packets_rx: Some(receiver_packets.clone()),
+                runtime: runtime.clone(),
+            }))
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
+            .build()
+            .await?,
+    );
+
+    offerer.create_data_channel("data", None).await?;
+    let audio_track = new_audio_track("stream-sfupc", "audio-sfupc", 0x1122_3344);
+    let audio_sender = offerer
+        .add_track(audio_track.clone() as Arc<dyn TrackLocal>)
+        .await?;
+
+    for _ in 0..2 {
+        offerer
+            .add_transceiver_from_kind(
+                RtpCodecKind::Audio,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+    }
+    for _ in 0..3 {
+        offerer
+            .add_transceiver_from_kind(
+                RtpCodecKind::Video,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+    }
+
+    negotiate(
+        &offerer,
+        &answerer,
+        &mut offer_gather_rx,
+        &mut answer_gather_rx,
+    )
+    .await?;
+
+    timeout(Duration::from_secs(10), offer_connected_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("offerer did not connect"))?
+        .ok_or_else(|| anyhow::anyhow!("offerer connection channel closed"))?;
+    timeout(Duration::from_secs(10), answer_connected_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("answerer did not connect"))?
+        .ok_or_else(|| anyhow::anyhow!("answerer connection channel closed"))?;
+
+    let sender_id = audio_sender.id();
+    let mut sender_mid = None;
+    for transceiver in offerer.get_transceivers().await {
+        let Some(sender) = transceiver.sender().await? else {
+            continue;
+        };
+        if sender.id() == sender_id {
+            sender_mid = transceiver.mid().await?;
+            break;
+        }
+    }
+    let sender_mid = sender_mid.ok_or_else(|| anyhow::anyhow!("could not find sender mid"))?;
+
+    for seq in 0..40u16 {
+        audio_track
+            .write_rtp_with_sdes_mid(
+                Packet {
+                    header: Header {
+                        version: 2,
+                        payload_type: 111,
+                        sequence_number: seq,
+                        timestamp: u32::from(seq) * 960,
+                        ssrc: 0x1122_3344,
+                        ..Default::default()
+                    },
+                    payload: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                },
+                sender_mid.as_bytes(),
+                false,
+            )
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_packets(&receiver_packets, 5).await?;
+
+    // Stage 2: reserve one more recvonly audio section.
+    offerer
+        .add_transceiver_from_kind(
+            RtpCodecKind::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    negotiate(
+        &offerer,
+        &answerer,
+        &mut offer_gather_rx,
+        &mut answer_gather_rx,
+    )
+    .await?;
+
+    let before_audio_growth = receiver_packets.load(Ordering::SeqCst);
+    for seq in 100..140u16 {
+        audio_track
+            .write_rtp_with_sdes_mid(
+                Packet {
+                    header: Header {
+                        version: 2,
+                        payload_type: 111,
+                        sequence_number: seq,
+                        timestamp: u32::from(seq) * 960,
+                        ssrc: 0x1122_3344,
+                        ..Default::default()
+                    },
+                    payload: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                },
+                sender_mid.as_bytes(),
+                false,
+            )
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_packets(&receiver_packets, before_audio_growth + 5).await?;
+
+    // Stage 3: reserve one more recvonly video section (mirrors second server-driven renegotiation).
+    offerer
+        .add_transceiver_from_kind(
+            RtpCodecKind::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    negotiate(
+        &offerer,
+        &answerer,
+        &mut offer_gather_rx,
+        &mut answer_gather_rx,
+    )
+    .await?;
+
+    let before_video_growth = receiver_packets.load(Ordering::SeqCst);
+    for seq in 200..240u16 {
+        audio_track
+            .write_rtp_with_sdes_mid(
+                Packet {
+                    header: Header {
+                        version: 2,
+                        payload_type: 111,
+                        sequence_number: seq,
+                        timestamp: u32::from(seq) * 960,
+                        ssrc: 0x1122_3344,
+                        ..Default::default()
+                    },
+                    payload: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+                },
+                sender_mid.as_bytes(),
+                false,
+            )
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    wait_for_packets(&receiver_packets, before_video_growth + 5).await?;
+
+    offerer.close().await?;
+    answerer.close().await?;
+    Ok(())
+}
+
+async fn run_answer_recvonly_publish_mid_test() -> anyhow::Result<()> {
+    let runtime = default_runtime().ok_or_else(|| std::io::Error::other("no runtime"))?;
+    let mut media = MediaEngine::default();
+    media.register_default_codecs()?;
+
+    let receiver_packets = Arc::new(AtomicUsize::new(0));
+    let (offer_gather_tx, mut offer_gather_rx) = channel(1);
+    let (answer_gather_tx, mut answer_gather_rx) = channel(1);
+    let (offer_connected_tx, mut offer_connected_rx) = channel(1);
+    let (answer_connected_tx, mut answer_connected_rx) = channel(1);
+
+    let offerer: Arc<dyn PeerConnection> = Arc::new(
+        PeerConnectionBuilder::new()
+            .with_media_engine(media.clone())
+            .with_handler(Arc::new(TestHandler {
+                gathered_tx: offer_gather_tx,
+                connected_tx: offer_connected_tx,
+                packets_rx: None,
+                runtime: runtime.clone(),
+            }))
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
+            .build()
+            .await?,
+    );
+
+    let answerer: Arc<dyn PeerConnection> = Arc::new(
+        PeerConnectionBuilder::new()
+            .with_media_engine(media)
+            .with_handler(Arc::new(TestHandler {
+                gathered_tx: answer_gather_tx,
+                connected_tx: answer_connected_tx,
+                packets_rx: Some(receiver_packets.clone()),
+                runtime: runtime.clone(),
+            }))
+            .with_runtime(runtime.clone())
+            .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
+            .build()
+            .await?,
+    );
+
+    offerer.create_data_channel("data", None).await?;
+    let audio_track = new_audio_track("stream-direction", "audio-direction", 0x2222_3333);
+    let audio_sender = offerer
+        .add_track(audio_track.clone() as Arc<dyn TrackLocal>)
+        .await?;
+
+    // Same shape as single-PC setup: existing publish m-line plus recvonly reserves.
+    for _ in 0..2 {
+        offerer
+            .add_transceiver_from_kind(
+                RtpCodecKind::Audio,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+    }
+    for _ in 0..3 {
+        offerer
+            .add_transceiver_from_kind(
+                RtpCodecKind::Video,
+                Some(RTCRtpTransceiverInit {
+                    direction: RTCRtpTransceiverDirection::Recvonly,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+    }
+
+    negotiate(
+        &offerer,
+        &answerer,
+        &mut offer_gather_rx,
+        &mut answer_gather_rx,
+    )
+    .await?;
+
+    timeout(Duration::from_secs(10), offer_connected_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("offerer did not connect"))?
+        .ok_or_else(|| anyhow::anyhow!("offerer connection channel closed"))?;
+    timeout(Duration::from_secs(10), answer_connected_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("answerer did not connect"))?
+        .ok_or_else(|| anyhow::anyhow!("answerer connection channel closed"))?;
+
+    let sender_id = audio_sender.id();
+    let mut sender_mid = None;
+    for transceiver in offerer.get_transceivers().await {
+        let Some(sender) = transceiver.sender().await? else {
+            continue;
+        };
+        if sender.id() == sender_id {
+            sender_mid = transceiver.mid().await?;
+            break;
+        }
+    }
+    let sender_mid = sender_mid.ok_or_else(|| anyhow::anyhow!("could not find sender mid"))?;
+
+    // Trigger a renegotiation and then rewrite the answer so MID 0 is recvonly,
+    // matching the failing single-PC trace shape.
+    offerer
+        .add_transceiver_from_kind(
+            RtpCodecKind::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+    let offer = offerer.create_offer(None).await?;
+    offerer.set_local_description(offer).await?;
+    let _ = timeout(Duration::from_secs(5), offer_gather_rx.recv()).await;
+
+    let offer_sdp = offerer
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("offerer local description missing"))?;
+    answerer.set_remote_description(offer_sdp).await?;
+
+    let answer = answerer.create_answer(None).await?;
+    answerer.set_local_description(answer).await?;
+    let _ = timeout(Duration::from_secs(5), answer_gather_rx.recv()).await;
+
+    let answer_sdp = answerer
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("answerer local description missing"))?;
+    let munged = rewrite_mid_direction(&answer_sdp.sdp, "0", "recvonly");
+    offerer
+        .set_remote_description(RTCSessionDescription::answer(munged)?)
+        .await?;
+
+    let before = receiver_packets.load(Ordering::SeqCst);
+    for seq in 300..360u16 {
+        audio_track
+            .write_rtp_with_sdes_mid(
+                Packet {
+                    header: Header {
+                        version: 2,
+                        payload_type: 111,
+                        sequence_number: seq,
+                        timestamp: u32::from(seq) * 960,
+                        ssrc: 0x2222_3333,
                         ..Default::default()
                     },
                     payload: bytes::Bytes::from_static(&[0xf8, 0xff, 0xfe]),
