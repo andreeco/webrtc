@@ -399,6 +399,12 @@ pub trait PeerConnection: Send + Sync + 'static {
     async fn get_transceivers(&self) -> Vec<Arc<dyn RtpTransceiver>>;
     /// Add a Track to the PeerConnection
     async fn add_track(&self, track: Arc<dyn TrackLocal>) -> Result<Arc<dyn RtpSender>>;
+    /// Adds a track to the existing sender-less transceiver with `mid`.
+    async fn add_track_to_mid(
+        &self,
+        mid: &str,
+        track: Arc<dyn TrackLocal>,
+    ) -> Result<Arc<dyn RtpSender>>;
     /// Remove a Track from the PeerConnection
     async fn remove_track(&self, sender: &Arc<dyn RtpSender>) -> Result<()>;
     /// Create a new RtpTransceiver(SendRecv or SendOnly) and add it to the set of transceivers
@@ -992,6 +998,28 @@ where
         ));
         rtp_transceiver.set_sender(Some(Arc::clone(&sender))).await;
 
+        Ok(sender)
+    }
+
+    async fn add_track_to_mid(
+        &self,
+        mid: &str,
+        track: Arc<dyn TrackLocal>,
+    ) -> Result<Arc<dyn RtpSender>> {
+        let id: RTCRtpTransceiverId = {
+            let mut core = self.inner.core.lock().await;
+            core.add_track_to_mid(mid, track.track().await)?.into()
+        };
+        let mut transceivers = self.inner.rtp_transceivers.lock().await;
+        let transceiver = transceivers
+            .entry(id)
+            .or_insert_with(|| Arc::new(RtpTransceiverImpl::new(id, Arc::clone(&self.inner))));
+        let sender: Arc<dyn RtpSender> = Arc::new(RtpSenderImpl::new(
+            id.into(),
+            Arc::clone(&self.inner),
+            track,
+        ));
+        transceiver.set_sender(Some(Arc::clone(&sender))).await;
         Ok(sender)
     }
 
