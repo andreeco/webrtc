@@ -4,19 +4,32 @@ use crate::media_stream::track_local::{TrackLocal, TrackLocalContext, TrackLocal
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
 use crate::runtime::{Mutex, Receiver};
 use bytes::{Bytes, BytesMut};
->>>>>>> db7b1be3 (track_local: add fast SDES MID write path for RTP forwarding)
 use rtc::media_stream::{
     MediaStreamId, MediaStreamTrack, MediaStreamTrackId, MediaStreamTrackState,
     MediaTrackCapabilities, MediaTrackConstraints, MediaTrackSettings,
 };
 use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind};
-use rtc::rtp_transceiver::{RtpStreamId, SSRC};
+use rtc::rtp_transceiver::{PayloadType, RtpStreamId, SSRC};
 use rtc::shared::error::flatten_errs;
 use rtc::shared::marshal::{Marshal, MarshalSize};
 use rtc::{rtcp, rtp};
 use std::collections::HashMap;
 
 const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+
+/// Outcome of binding a static RTP track to a negotiated sender context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackLocalStaticRtpBindResult {
+    /// No sender context has bound this track.
+    Pending,
+    /// The negotiated context has a compatible codec and selected payload type.
+    Compatible {
+        /// Payload type selected from the remote peer's negotiated codec parameters.
+        payload_type: PayloadType,
+    },
+    /// The negotiated context contains no compatible codec.
+    UnsupportedCodec,
+}
 
 /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
 /// If you wish to send a media.Sample use TrackLocalStaticSample
@@ -26,6 +39,7 @@ pub struct TrackLocalStaticRTP {
     pub(crate) ctx: Mutex<Option<TrackLocalContext>>,
     /// Delivers RTCP feedback received about this sent track (set on bind).
     pub(crate) evt_rx: Mutex<Option<Receiver<TrackLocalEvent>>>,
+    bind_result: Mutex<TrackLocalStaticRtpBindResult>,
 }
 
 impl TrackLocalStaticRTP {
@@ -35,7 +49,13 @@ impl TrackLocalStaticRTP {
             track: Mutex::new(track),
             ctx: Mutex::new(None),
             evt_rx: Mutex::new(None),
+            bind_result: Mutex::new(TrackLocalStaticRtpBindResult::Pending),
         }
+    }
+
+    /// Returns the most recent negotiated sender binding outcome.
+    pub async fn bind_result(&self) -> TrackLocalStaticRtpBindResult {
+        self.bind_result.lock().await.clone()
     }
 
     /// Writes an RTP packet to the track with the specified header extensions.
@@ -273,13 +293,27 @@ impl TrackLocal for TrackLocalStaticRTP {
     }
 
     async fn bind(&self, ctx: TrackLocalContext, evt_rx: Receiver<TrackLocalEvent>) {
-        *self.ctx.lock().await = Some(ctx);
+        let bind_result = match ctx.prepared_rtp.as_ref() {
+            Some(prepared) => TrackLocalStaticRtpBindResult::Compatible {
+                payload_type: prepared.payload_type,
+            },
+            None => TrackLocalStaticRtpBindResult::UnsupportedCodec,
+        };
+        let is_compatible = matches!(
+            bind_result,
+            TrackLocalStaticRtpBindResult::Compatible { .. }
+        );
+        *self.bind_result.lock().await = bind_result;
+        *self.ctx.lock().await = is_compatible.then_some(ctx);
         *self.evt_rx.lock().await = Some(evt_rx);
     }
 
     async fn unbind(&self) {
+        *self.bind_result.lock().await = TrackLocalStaticRtpBindResult::Pending;
         *self.ctx.lock().await = None;
         *self.evt_rx.lock().await = None;
+    }
+
     }
 
     async fn write_rtp(&self, packet: rtp::Packet) -> Result<()> {
