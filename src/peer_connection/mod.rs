@@ -596,6 +596,17 @@ where
             let mut core = self.inner.core.lock().await;
             core.set_remote_description(desc)?;
         }
+        let transceivers = self
+            .inner
+            .rtp_transceivers
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for transceiver in transceivers {
+            transceiver.refresh_sender_binding().await;
+        }
         // Wake the driver so it re-polls its timeout. When both local and remote
         // descriptions are set, set_remote_description triggers start_transports
         // internally, which arms the ICE connectivity-check timer. Without this

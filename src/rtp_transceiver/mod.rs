@@ -156,30 +156,40 @@ where
         }
     }
 
+    async fn bind_sender_track(&self, rtp_sender: Arc<dyn RtpSender>) {
+        let Ok(params) = rtp_sender.get_parameters().await else {
+            return;
+        };
+        rtp_sender
+            .track()
+            .bind(TrackLocalContext {
+                rtp_sender_id: self.id.into(),
+                prepared_rtp: TrackLocalContext::build_prepared_rtp(
+                    self.id.into(),
+                    &params.rtp_parameters,
+                    &params.encodings,
+                ),
+                rtp_parameters: params.rtp_parameters,
+                driver_event_tx: self.inner.driver_event_tx.clone(),
+            })
+            .await;
+    }
+
     pub(crate) async fn set_sender(&self, rtp_sender: Option<Arc<dyn RtpSender>>) {
-        let mut sender = self.sender.lock().await;
-
-        if let Some(rtp_sender) = sender.take() {
-            rtp_sender.track().unbind().await;
+        let previous_sender = self.sender.lock().await.take();
+        if let Some(previous_sender) = previous_sender {
+            previous_sender.track().unbind().await;
         }
+        if let Some(rtp_sender) = rtp_sender {
+            self.bind_sender_track(rtp_sender.clone()).await;
+            *self.sender.lock().await = Some(rtp_sender);
+        }
+    }
 
-        if let Some(rtp_sender) = rtp_sender
-            && let Ok(params) = rtp_sender.get_parameters().await
-        {
-            rtp_sender
-                .track()
-                .bind(TrackLocalContext {
-                    rtp_sender_id: self.id.into(),
-                    prepared_rtp: TrackLocalContext::build_prepared_rtp(
-                        self.id.into(),
-                        &params.rtp_parameters,
-                        &params.encodings,
-                    ),
-                    rtp_parameters: params.rtp_parameters,
-                    driver_event_tx: self.inner.driver_event_tx.clone(),
-                })
-                .await;
-            *sender = Some(rtp_sender);
+    /// Rebinds after remote SDP selects this sender's negotiated codec set.
+    pub(crate) async fn refresh_sender_binding(&self) {
+        if let Some(rtp_sender) = self.sender.lock().await.clone() {
+            self.bind_sender_track(rtp_sender).await;
         }
     }
 

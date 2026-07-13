@@ -102,8 +102,7 @@ impl TrackLocalContext {
                         .mime_type
                         .eq_ignore_ascii_case(&first_coding.codec.mime_type)
                 })
-            })
-            .or_else(|| rtp_parameters.codecs.first())?
+            })?
             .payload_type;
 
         Some(PreparedTrackLocalRtpContext {
@@ -164,6 +163,36 @@ mod tests {
                 .expect("prepared RTP context should be available");
 
         assert_eq!(prepared.payload_type, 96);
+    }
+
+    #[test]
+    fn prepared_rtp_rejects_an_unrelated_negotiated_codec() {
+        let parameters = RTCRtpParameters {
+            codecs: vec![RTCRtpCodecParameters {
+                rtp_codec: codec("video/vp8"),
+                payload_type: 96,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let codings = vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters {
+                ssrc: Some(1234),
+                ..Default::default()
+            },
+            codec: codec("video/h264"),
+            ..Default::default()
+        }];
+
+        assert!(
+            TrackLocalContext::build_prepared_rtp(
+                RTCRtpSenderId::default(),
+                &parameters,
+                &codings,
+            )
+            .is_none(),
+            "an H264 source must not bind to a VP8-only negotiated context"
+        );
     }
 }
 
