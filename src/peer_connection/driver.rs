@@ -93,6 +93,7 @@ where
     detached_data_channel_send_counts: HashMap<rtc::data_channel::RTCDataChannelId, u64>,
     data_channel_event_send_counts: HashMap<rtc::data_channel::RTCDataChannelId, u64>,
     event_send_recovered: bool,
+    core_writes: Vec<TaggedBytesMut>,
 }
 
 impl<I> PeerConnectionDriver<I>
@@ -125,6 +126,7 @@ where
             detached_data_channel_send_counts: HashMap::new(),
             data_channel_event_send_counts: HashMap::new(),
             event_send_recovered: false,
+            core_writes: Vec::new(),
         })
     }
 
@@ -1006,13 +1008,12 @@ where
         }
     }
 
-    async fn drain_core_writes(inner: Arc<PeerConnectionRef<I>>) -> Vec<TaggedBytesMut> {
-        let mut writes = Vec::new();
+    async fn drain_core_writes(inner: Arc<PeerConnectionRef<I>>, writes: &mut Vec<TaggedBytesMut>) {
+        writes.clear();
         let mut core = inner.core.lock().await;
         while let Some(msg) = core.poll_write() {
             writes.push(msg);
         }
-        writes
     }
 
     async fn drain_core_events(inner: Arc<PeerConnectionRef<I>>) -> Vec<RTCPeerConnectionEvent> {
@@ -1076,7 +1077,9 @@ where
 
         // 1.c peer_connection poll_write() - Send all outgoing packets
         let mut wrote_core_packet = false;
-        for msg in Self::drain_core_writes(self.inner.clone()).await {
+        let mut core_writes = std::mem::take(&mut self.core_writes);
+        Self::drain_core_writes(self.inner.clone(), &mut core_writes).await;
+        for msg in core_writes.drain(..) {
             wrote_core_packet = true;
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
             if let Err(err) = self.handle_write(msg).await {
@@ -1086,6 +1089,8 @@ where
                 );
             }
         }
+
+        self.core_writes = core_writes;
 
         if wrote_core_packet {
             debug!("peer_connection_driver_core_write_ready");
