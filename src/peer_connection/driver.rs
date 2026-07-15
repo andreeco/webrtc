@@ -586,10 +586,7 @@ where
                                 vec![],
                             )
                         });
-                        let mid = core
-                            .rtp_transceiver(init.receiver_id.into())
-                            .and_then(|transceiver| transceiver.mid().clone());
-                        (init.receiver_id.into(), track, mid)
+                        (init.receiver_id.into(), track, init.mid.clone())
                     };
 
                     if let Some(track) = track {
