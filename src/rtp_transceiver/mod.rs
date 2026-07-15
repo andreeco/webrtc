@@ -191,7 +191,11 @@ where
         let previous_sender = self.sender.lock().await.take();
         if let Some(previous_sender) = previous_sender {
             let track_id = previous_sender.track().track_id().await;
-            self.inner.track_local_events_tx.lock().await.remove(&track_id);
+            self.inner
+                .track_local_events_tx
+                .lock()
+                .await
+                .remove(&track_id);
             previous_sender.track().unbind().await;
         }
         if let Some(rtp_sender) = rtp_sender {

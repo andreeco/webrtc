@@ -314,8 +314,6 @@ impl TrackLocal for TrackLocalStaticRTP {
         *self.evt_rx.lock().await = None;
     }
 
-    }
-
     async fn write_rtp(&self, packet: rtp::Packet) -> Result<()> {
         let ctx_opt = self.ctx.lock().await;
         if let Some(ctx) = &*ctx_opt {

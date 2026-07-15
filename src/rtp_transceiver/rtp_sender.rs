@@ -1,7 +1,9 @@
 use crate::error::{Error, Result};
 use crate::media_stream::track_local::TrackLocal;
+use crate::peer_connection::driver::TRACK_LOCAL_EVENT_CHANNEL_CAPACITY;
 use crate::peer_connection::{Interceptor, NoopInterceptor, PeerConnectionRef};
 use crate::rtp_transceiver::RtpSender;
+use crate::runtime::channel;
 use rtc::media_stream::MediaStreamId;
 use rtc::rtp_transceiver::RTCRtpSenderId;
 use rtc::rtp_transceiver::rtp_sender::{
@@ -118,18 +120,28 @@ where
             (params.rtp_parameters.clone(), params.encodings.clone())
         };
 
+        let track_id = track.track_id().await;
+        let (evt_tx, evt_rx) = channel(TRACK_LOCAL_EVENT_CHANNEL_CAPACITY);
+        self.inner
+            .track_local_events_tx
+            .lock()
+            .await
+            .insert(track_id, evt_tx);
         track
-            .bind(crate::media_stream::track_local::TrackLocalContext {
-                rtp_sender_id: self.id,
-                prepared_rtp:
-                    crate::media_stream::track_local::TrackLocalContext::build_prepared_rtp(
-                        self.id,
-                        &rtp_parameters,
-                        &encodings,
-                    ),
-                rtp_parameters,
-                driver_event_tx: self.inner.driver_event_tx.clone(),
-            })
+            .bind(
+                crate::media_stream::track_local::TrackLocalContext {
+                    rtp_sender_id: self.id,
+                    prepared_rtp:
+                        crate::media_stream::track_local::TrackLocalContext::build_prepared_rtp(
+                            self.id,
+                            &rtp_parameters,
+                            &encodings,
+                        ),
+                    rtp_parameters,
+                    driver_event_tx: self.inner.driver_event_tx.clone(),
+                },
+                evt_rx,
+            )
             .await;
 
         Ok(())
