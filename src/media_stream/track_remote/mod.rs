@@ -70,6 +70,9 @@ pub enum TrackRemoteEvent {
 /// and sending RTCP feedback (such as PLI, SLI, or NACK) back to the sender.
 #[async_trait::async_trait]
 pub trait TrackRemote: Track {
+    /// Returns the negotiated SDP media-section MID for this remote track.
+    async fn mid(&self) -> Option<String>;
+
     /// Writes RTCP feedback packets to the remote track sender.
     async fn write_rtcp(&self, packets: Vec<Box<dyn rtcp::Packet>>) -> Result<()>;
 
