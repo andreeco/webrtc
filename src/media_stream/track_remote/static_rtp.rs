@@ -15,6 +15,7 @@ use rtc::rtp_transceiver::{RTCRtpReceiverId, RtpStreamId, SSRC};
 #[derive(Clone)]
 pub(crate) struct TrackRemoteStaticRTP {
     track: Mutex<MediaStreamTrack>,
+    mid: Option<String>,
     receiver_id: RTCRtpReceiverId,
     msg_tx: Sender<PeerConnectionDriverEvent>,
     evt_rx: Mutex<Receiver<TrackRemoteEvent>>,
@@ -23,12 +24,14 @@ pub(crate) struct TrackRemoteStaticRTP {
 impl TrackRemoteStaticRTP {
     pub fn new(
         track: MediaStreamTrack,
+        mid: Option<String>,
         receiver_id: RTCRtpReceiverId,
         msg_tx: Sender<PeerConnectionDriverEvent>,
         evt_rx: Receiver<TrackRemoteEvent>,
     ) -> Self {
         Self {
             track: Mutex::new(track),
+            mid,
             receiver_id,
             msg_tx,
             evt_rx: Mutex::new(evt_rx),
@@ -136,6 +139,10 @@ impl Track for TrackRemoteStaticRTP {
 
 #[async_trait::async_trait]
 impl TrackRemote for TrackRemoteStaticRTP {
+    async fn mid(&self) -> Option<String> {
+        self.mid.clone()
+    }
+
     async fn write_rtcp(&self, packets: Vec<Box<dyn rtc::rtcp::Packet>>) -> Result<()> {
         self.msg_tx
             .send(PeerConnectionDriverEvent::ReceiverRtcp(

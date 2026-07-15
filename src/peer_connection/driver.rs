@@ -574,21 +574,22 @@ where
                 let mut pending_on_track = None;
 
                 if let RTCTrackEvent::OnOpen(init) = &evt {
-                    let (id, track) = {
+                    let (id, track, mid) = {
                         let mut core = self.inner.core.lock().await;
-                        (
-                            init.receiver_id.into(),
-                            core.rtp_receiver(init.receiver_id).map(|receiver| {
-                                let track = receiver.track();
-                                MediaStreamTrack::new(
-                                    track.stream_id().clone(),
-                                    track.track_id().clone(),
-                                    track.label().clone(),
-                                    track.kind(),
-                                    vec![],
-                                )
-                            }),
-                        )
+                        let track = core.rtp_receiver(init.receiver_id).map(|receiver| {
+                            let track = receiver.track();
+                            MediaStreamTrack::new(
+                                track.stream_id().clone(),
+                                track.track_id().clone(),
+                                track.label().clone(),
+                                track.kind(),
+                                vec![],
+                            )
+                        });
+                        let mid = core
+                            .rtp_transceiver(init.receiver_id.into())
+                            .and_then(|transceiver| transceiver.mid().clone());
+                        (init.receiver_id.into(), track, mid)
                     };
 
                     if let Some(track) = track {
@@ -607,6 +608,7 @@ where
                             let track_remote: Arc<dyn TrackRemote> =
                                 Arc::new(TrackRemoteStaticRTP::new(
                                     track,
+                                    mid,
                                     init.receiver_id,
                                     self.inner.driver_event_tx.clone(),
                                     evt_rx,

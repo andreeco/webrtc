@@ -32,6 +32,9 @@ struct TrackObservation {
     ssrcs: Vec<u32>,
     codec_mime: Option<String>,
     codings_len: usize,
+    mid: Option<String>,
+    stream_id: String,
+    track_id: String,
 }
 
 struct WebrtcHandler {
@@ -65,6 +68,9 @@ impl PeerConnectionEventHandler for WebrtcHandler {
             ssrcs,
             codec_mime,
             codings_len,
+            mid: track.mid().await,
+            stream_id: track.stream_id().await.to_string(),
+            track_id: track.track_id().await.to_string(),
         });
     }
 }
@@ -254,6 +260,9 @@ async fn run_test() -> Result<()> {
             assert_eq!(observation.ssrcs, vec![test_ssrc]);
             assert_eq!(observation.codec_mime.as_deref(), Some(MIME_TYPE_VP8));
             assert_eq!(observation.codings_len, 1);
+            assert_eq!(observation.mid.as_deref(), Some("0"));
+            assert_eq!(observation.stream_id, "test-stream");
+            assert_eq!(observation.track_id, "video-track");
             break;
         }
 
