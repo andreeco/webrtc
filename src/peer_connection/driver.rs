@@ -54,6 +54,9 @@ pub(crate) const TRACK_LOCAL_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 const DEFAULT_TIMEOUT_DURATION: Duration = Duration::from_secs(86400); // 1 day duration
 const UDP_RECV_BUF_LEN: usize = 2000;
+/// Maximum number of immediately sendable core datagrams handled before the
+/// driver returns to its timer, socket, close, and application-event select.
+const CORE_WRITE_BATCH_SIZE: usize = 64;
 
 /// Unified inner message type for the peer connection driver
 #[derive(Debug)]
@@ -215,7 +218,10 @@ where
             // data: a send that set the flag is either already enqueued (drained
             // this iteration) or enqueues a fresh `WriteNotify` for the next one.
             self.inner.write_pending.store(false, Ordering::Release);
-            self.poll_writes().await?;
+            let core_writes_pending = self.poll_writes().await?;
+            if core_writes_pending {
+                self.inner.schedule_write_continuation();
+            }
             self.poll_events().await;
             self.poll_reads().await?;
 
@@ -1008,12 +1014,15 @@ where
         }
     }
 
-    async fn drain_core_writes(inner: Arc<PeerConnectionRef<I>>, writes: &mut Vec<TaggedBytesMut>) {
-        writes.clear();
+    async fn drain_core_writes(
+        inner: Arc<PeerConnectionRef<I>>,
+        writes: &mut Vec<TaggedBytesMut>,
+    ) -> bool {
+        // Keep core processing and the bounded dequeue under its mutex, but release
+        // it before the async socket writes below.
         let mut core = inner.core.lock().await;
-        while let Some(msg) = core.poll_write() {
-            writes.push(msg);
-        }
+        core.poll_write_batch(CORE_WRITE_BATCH_SIZE, writes)
+            .more_writes_pending
     }
 
     async fn drain_core_events(inner: Arc<PeerConnectionRef<I>>) -> Vec<RTCPeerConnectionEvent> {
@@ -1034,7 +1043,7 @@ where
         messages
     }
 
-    async fn poll_writes(&mut self) -> Result<()> {
+    async fn poll_writes(&mut self) -> Result<bool> {
         // 1.a stun_gatherer poll_write()
         while let Some(msg) = self.stun_gatherer.poll_write() {
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
@@ -1078,7 +1087,8 @@ where
         // 1.c peer_connection poll_write() - Send all outgoing packets
         let mut wrote_core_packet = false;
         let mut core_writes = std::mem::take(&mut self.core_writes);
-        Self::drain_core_writes(self.inner.clone(), &mut core_writes).await;
+        let core_writes_pending =
+            Self::drain_core_writes(self.inner.clone(), &mut core_writes).await;
         for msg in core_writes.drain(..) {
             wrote_core_packet = true;
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
@@ -1108,7 +1118,7 @@ where
             self.event_send_recovered = false;
         }
 
-        Ok(())
+        Ok(core_writes_pending)
     }
 
     async fn poll_events(&mut self) {

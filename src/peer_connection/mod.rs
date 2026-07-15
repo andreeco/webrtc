@@ -482,10 +482,33 @@ where
 /// the send buffer run far ahead of the ~1 MB SCTP window.
 const WRITE_YIELD_INTERVAL: usize = 128;
 
+/// Set the write-continuation gate and enqueue one non-blocking driver wake.
+fn schedule_write_continuation(
+    write_pending: &AtomicBool,
+    driver_event_tx: &Sender<PeerConnectionDriverEvent>,
+) -> bool {
+    if !write_pending.swap(true, Ordering::AcqRel) {
+        let _ = driver_event_tx.try_send(PeerConnectionDriverEvent::WriteNotify);
+        true
+    } else {
+        false
+    }
+}
+
 impl<I> PeerConnectionRef<I>
 where
     I: Interceptor,
 {
+    /// Marks a core write continuation as pending and enqueues at most one wake.
+    ///
+    /// This is shared by application writes and the driver's bounded-batch
+    /// continuation path. A failed non-blocking send is safe because a queued
+    /// event will return the driver to its top-of-loop drain.
+    #[inline]
+    pub(crate) fn schedule_write_continuation(&self) -> bool {
+        schedule_write_continuation(&self.write_pending, &self.driver_event_tx)
+    }
+
     /// Coalescing driver wake for pending writes — the pion `awakeWriteLoop`
     /// equivalent. Marks a flush as pending and pokes the driver only on the
     /// `false -> true` transition, so a burst of sends yields at most one wake.
@@ -505,12 +528,9 @@ where
     /// runtimes such as smol — both collapse throughput.
     #[inline]
     pub(crate) async fn wake_writes(&self) {
-        if !self.write_pending.swap(true, Ordering::AcqRel) {
-            let _ = self
-                .driver_event_tx
-                .try_send(PeerConnectionDriverEvent::WriteNotify);
-        } else if self.write_backpressure.fetch_add(1, Ordering::Relaxed) % WRITE_YIELD_INTERVAL
-            == WRITE_YIELD_INTERVAL - 1
+        if !self.schedule_write_continuation()
+            && self.write_backpressure.fetch_add(1, Ordering::Relaxed) % WRITE_YIELD_INTERVAL
+                == WRITE_YIELD_INTERVAL - 1
         {
             crate::runtime::yield_now().await;
         }
@@ -1110,5 +1130,36 @@ where
     async fn get_stats(&self, now: Instant, selector: StatsSelector) -> RTCStatsReport {
         let mut core = self.inner.core.lock().await;
         core.get_stats(now, selector)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{TryRecvError, channel};
+
+    #[test]
+    fn core_batch_continuations_coalesce_to_one_driver_wake() {
+        let (tx, mut rx) = channel(4);
+        let pending = AtomicBool::new(false);
+
+        assert!(schedule_write_continuation(&pending, &tx));
+        assert!(!schedule_write_continuation(&pending, &tx));
+        assert!(!schedule_write_continuation(&pending, &tx));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PeerConnectionDriverEvent::WriteNotify)
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // The driver clears the gate before each batch; a later non-empty batch
+        // therefore schedules one new continuation, rather than spin-draining it.
+        pending.store(false, Ordering::Release);
+        assert!(schedule_write_continuation(&pending, &tx));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PeerConnectionDriverEvent::WriteNotify)
+        ));
     }
 }
