@@ -31,12 +31,17 @@ pub enum TrackLocalStaticRtpBindResult {
     UnsupportedCodec,
 }
 
+struct TrackLocalStaticRtpBinding {
+    context: TrackLocalContext,
+    mid_extension_id: Option<u8>,
+}
+
 /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
 /// If you wish to send a media.Sample use TrackLocalStaticSample
 #[derive(Clone)]
 pub struct TrackLocalStaticRTP {
     pub(crate) track: Mutex<MediaStreamTrack>,
-    pub(crate) ctx: Mutex<Option<TrackLocalContext>>,
+    ctx: Mutex<Option<TrackLocalStaticRtpBinding>>,
     /// Delivers RTCP feedback received about this sent track (set on bind).
     pub(crate) evt_rx: Mutex<Option<Receiver<TrackLocalEvent>>>,
     bind_result: Mutex<TrackLocalStaticRtpBindResult>,
@@ -90,6 +95,7 @@ impl TrackLocalStaticRTP {
             if let Some(ctx) = &*ctx {
                 for (uri, data) in extension_data.iter() {
                     if let Some(id) = ctx
+                        .context
                         .rtp_parameters
                         .header_extensions
                         .iter()
@@ -150,17 +156,11 @@ impl TrackLocalStaticRTP {
             let Some(ctx) = &*ctx else {
                 return Err(Error::ErrBindFailed);
             };
-            let mid_ext_id = ctx
-                .rtp_parameters
-                .header_extensions
-                .iter()
-                .find(|ext| ext.uri == SDES_MID_URI)
-                .map(|ext| ext.id as u8);
             (
-                ctx.driver_event_tx.clone(),
-                ctx.rtp_sender_id,
-                mid_ext_id,
-                ctx.prepared_rtp.clone(),
+                ctx.context.driver_event_tx.clone(),
+                ctx.context.rtp_sender_id,
+                ctx.mid_extension_id,
+                ctx.context.prepared_rtp.clone(),
             )
         };
 
@@ -299,12 +299,22 @@ impl TrackLocal for TrackLocalStaticRTP {
             },
             None => TrackLocalStaticRtpBindResult::UnsupportedCodec,
         };
-        let is_compatible = matches!(
+        let mid_extension_id = ctx
+            .rtp_parameters
+            .header_extensions
+            .iter()
+            .find(|extension| extension.uri == SDES_MID_URI)
+            .map(|extension| extension.id as u8);
+        let binding = matches!(
             bind_result,
             TrackLocalStaticRtpBindResult::Compatible { .. }
-        );
+        )
+        .then_some(TrackLocalStaticRtpBinding {
+            context: ctx,
+            mid_extension_id,
+        });
         *self.bind_result.lock().await = bind_result;
-        *self.ctx.lock().await = is_compatible.then_some(ctx);
+        *self.ctx.lock().await = binding;
         *self.evt_rx.lock().await = Some(evt_rx);
     }
 
@@ -317,9 +327,9 @@ impl TrackLocal for TrackLocalStaticRTP {
     async fn write_rtp(&self, packet: rtp::Packet) -> Result<()> {
         let ctx_opt = self.ctx.lock().await;
         if let Some(ctx) = &*ctx_opt {
-            let tx = ctx.driver_event_tx.clone();
-            let rtp_sender_id = ctx.rtp_sender_id;
-            let prepared_rtp = ctx.prepared_rtp.clone();
+            let tx = ctx.context.driver_event_tx.clone();
+            let rtp_sender_id = ctx.context.rtp_sender_id;
+            let prepared_rtp = ctx.context.prepared_rtp.clone();
             drop(ctx_opt);
             let event = if let Some(prepared) = prepared_rtp {
                 PeerConnectionDriverEvent::SenderRtpPrepared {
@@ -342,8 +352,8 @@ impl TrackLocal for TrackLocalStaticRTP {
     async fn write_rtcp(&self, packets: Vec<Box<dyn rtcp::Packet>>) -> Result<()> {
         let ctx_opt = self.ctx.lock().await;
         if let Some(ctx) = &*ctx_opt {
-            let tx = ctx.driver_event_tx.clone();
-            let rtp_sender_id = ctx.rtp_sender_id;
+            let tx = ctx.context.driver_event_tx.clone();
+            let rtp_sender_id = ctx.context.rtp_sender_id;
             drop(ctx_opt);
             tx.send(PeerConnectionDriverEvent::SenderRtcp(
                 rtp_sender_id,
@@ -362,5 +372,207 @@ impl TrackLocal for TrackLocalStaticRTP {
             Some(rx) => rx.recv().await,
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media_stream::track_local::PreparedTrackLocalRtpContext;
+    use crate::runtime::{block_on, channel};
+    use rtc::media_stream::MediaStreamTrack;
+    use rtc::rtp::header::Header;
+    use rtc::rtp::packet::Packet;
+    use rtc::rtp_transceiver::RTCRtpSenderId;
+    use rtc::rtp_transceiver::rtp_sender::{
+        RTCRtpHeaderExtensionParameters, RTCRtpParameters, RtpCodecKind,
+    };
+
+    fn track() -> TrackLocalStaticRTP {
+        TrackLocalStaticRTP::new(MediaStreamTrack::new(
+            "stream".to_owned(),
+            "track".to_owned(),
+            "track".to_owned(),
+            RtpCodecKind::Video,
+            vec![],
+        ))
+    }
+
+    fn packet() -> Packet {
+        Packet {
+            header: Header {
+                version: 2,
+                payload_type: 96,
+                sequence_number: 0x1234,
+                timestamp: 0x0102_0304,
+                ssrc: 0x0506_0708,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(&[0xaa, 0xbb]),
+        }
+    }
+
+    fn context(
+        sender_id: RTCRtpSenderId,
+        mid_extension_id: u16,
+        driver_event_tx: crate::runtime::Sender<PeerConnectionDriverEvent>,
+    ) -> TrackLocalContext {
+        TrackLocalContext {
+            rtp_sender_id: sender_id,
+            rtp_parameters: RTCRtpParameters {
+                header_extensions: vec![RTCRtpHeaderExtensionParameters {
+                    uri: SDES_MID_URI.to_owned(),
+                    id: mid_extension_id,
+                    encrypted: false,
+                }],
+                ..Default::default()
+            },
+            driver_event_tx,
+            prepared_rtp: Some(PreparedTrackLocalRtpContext {
+                rtp_sender_id: sender_id,
+                ssrc: 0x1112_1314,
+                payload_type: 97,
+            }),
+        }
+    }
+
+    async fn bind(
+        track: &TrackLocalStaticRTP,
+        sender_id: RTCRtpSenderId,
+        mid_extension_id: u16,
+    ) -> crate::runtime::Receiver<PeerConnectionDriverEvent> {
+        let (driver_event_tx, driver_event_rx) = channel(2);
+        let (_event_tx, event_rx) = channel(1);
+        track
+            .bind(
+                context(sender_id, mid_extension_id, driver_event_tx),
+                event_rx,
+            )
+            .await;
+        driver_event_rx
+    }
+
+    fn sender_packet(event: PeerConnectionDriverEvent) -> Packet {
+        match event {
+            PeerConnectionDriverEvent::SenderRtpPrepared { packet, .. }
+            | PeerConnectionDriverEvent::SenderRtp(_, packet) => packet,
+            event => panic!("expected RTP event, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn sdes_mid_injection_has_exact_rtp_output() {
+        block_on(async {
+            let track = track();
+            let mut events = bind(&track, RTCRtpSenderId::default(), 4).await;
+
+            track
+                .write_rtp_with_sdes_mid(packet(), b"a", false)
+                .await
+                .expect("MID write should queue an RTP packet");
+
+            let packet = sender_packet(events.recv().await.expect("queued RTP event"));
+            let mut actual = vec![0; packet.marshal_size()];
+            packet
+                .marshal_to(&mut actual)
+                .expect("packet should marshal");
+
+            assert_eq!(
+                actual,
+                [
+                    0x90, 0x60, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xbe,
+                    0xde, 0x00, 0x01, 0x40, b'a', 0x00, 0x00, 0xaa, 0xbb,
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn sdes_mid_uses_the_extension_id_cached_at_bind_time() {
+        block_on(async {
+            let track = track();
+            let mut events = bind(&track, RTCRtpSenderId::default(), 4).await;
+            track
+                .ctx
+                .lock()
+                .await
+                .as_mut()
+                .expect("bound context")
+                .context
+                .rtp_parameters
+                .header_extensions[0]
+                .id = 9;
+
+            track
+                .write_rtp_with_sdes_mid(packet(), b"mid", false)
+                .await
+                .expect("MID write should queue an RTP packet");
+
+            let packet = sender_packet(events.recv().await.expect("queued RTP event"));
+            assert_eq!(packet.header.extensions[0].id, 4);
+        });
+    }
+
+    #[test]
+    fn sdes_mid_write_delivers_to_multiple_independently_bound_targets() {
+        block_on(async {
+            let first_track = track();
+            let second_track = track();
+            let mut first_events = bind(&first_track, RTCRtpSenderId::default(), 4).await;
+            let mut second_events = bind(&second_track, RTCRtpSenderId::default(), 9).await;
+
+            first_track
+                .write_rtp_with_sdes_mid(packet(), b"target", false)
+                .await
+                .expect("first target write should queue RTP");
+            second_track
+                .write_rtp_with_sdes_mid(packet(), b"target", false)
+                .await
+                .expect("second target write should queue RTP");
+
+            let first = sender_packet(first_events.recv().await.expect("first target RTP event"));
+            let second =
+                sender_packet(second_events.recv().await.expect("second target RTP event"));
+            assert_eq!(first.header.extensions[0].id, 4);
+            assert_eq!(second.header.extensions[0].id, 9);
+        });
+    }
+
+    #[test]
+    fn sdes_mid_write_keeps_source_and_target_packets_independent() {
+        block_on(async {
+            let first_track = track();
+            let second_track = track();
+            let mut first_events = bind(&first_track, RTCRtpSenderId::default(), 4).await;
+            let mut second_events = bind(&second_track, RTCRtpSenderId::default(), 9).await;
+            let source = packet();
+            let source_before_write = source.clone();
+
+            first_track
+                .write_rtp_with_sdes_mid(source.clone(), b"owned", false)
+                .await
+                .expect("first target write should queue RTP");
+            second_track
+                .write_rtp_with_sdes_mid(source.clone(), b"owned", false)
+                .await
+                .expect("second target write should queue RTP");
+
+            assert_eq!(
+                source, source_before_write,
+                "write must not mutate the caller packet"
+            );
+
+            let mut first =
+                sender_packet(first_events.recv().await.expect("first target RTP event"));
+            let second =
+                sender_packet(second_events.recv().await.expect("second target RTP event"));
+            first.header.extensions[0].payload = Bytes::from_static(b"changed");
+
+            assert_eq!(
+                second.header.extensions[0].payload,
+                Bytes::from_static(b"owned")
+            );
+            assert_eq!(second.payload, source.payload);
+        });
     }
 }
