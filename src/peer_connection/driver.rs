@@ -15,7 +15,9 @@ use crate::peer_connection::transports::tcp_transport::RTCTcpTransport;
 use crate::peer_connection::transports::{SocketRecvResult, is_retryable_socket_recv_error};
 use crate::rtp_transceiver::rtp_receiver::RtpReceiverImpl;
 use crate::rtp_transceiver::{RtpReceiver, RtpTransceiverImpl};
-use crate::runtime::{AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, Receiver, channel};
+use crate::runtime::{
+    AsyncTcpListener, AsyncTcpStream, AsyncUdpSocket, Receiver, TryRecvError, channel,
+};
 use bytes::BytesMut;
 use futures::FutureExt; // For .fuse() in futures::select!
 use futures::future::OptionFuture;
@@ -57,6 +59,31 @@ const UDP_RECV_BUF_LEN: usize = 2000;
 /// Maximum number of immediately sendable core datagrams handled before the
 /// driver returns to its timer, socket, close, and application-event select.
 const CORE_WRITE_BATCH_SIZE: usize = 64;
+
+/// Maximum number of ready driver events handled before returning to the event
+/// loop's timer, socket, close, and application-event select.
+const DRIVER_EVENT_BATCH_SIZE: usize = 64;
+
+/// Drains a bounded FIFO batch of already-ready driver events.
+///
+/// The first event comes from the event loop's awaited receive. Any additional
+/// events are read non-blockingly, preserving channel order. The caller must
+/// process the entire resulting vector before awaiting another event.
+fn drain_ready_driver_events(
+    events: &mut Vec<PeerConnectionDriverEvent>,
+    first: PeerConnectionDriverEvent,
+    receiver: &mut Receiver<PeerConnectionDriverEvent>,
+) {
+    debug_assert!(events.is_empty());
+    events.push(first);
+
+    while events.len() < DRIVER_EVENT_BATCH_SIZE {
+        match receiver.try_recv() {
+            Ok(event) => events.push(event),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        }
+    }
+}
 
 /// Unified inner message type for the peer connection driver
 #[derive(Debug)]
@@ -191,6 +218,7 @@ where
             })
             .collect();
         let mut active_socket_count = udp_socket_list.len();
+        let mut ready_driver_events = Vec::with_capacity(DRIVER_EVENT_BATCH_SIZE);
 
         // Batch-drain: after one datagram wakes the select, non-blockingly drain a
         // bounded burst of additional ready datagrams from the same socket and feed
@@ -274,7 +302,12 @@ where
                 // Driver events (RTP, RTCP, or ICE candidate)
                 evt = driver_event_rx.recv().fuse() => {
                     if let Some(evt) = evt {
-                        let is_closed = self.handle_driver_event(evt).await;
+                        drain_ready_driver_events(
+                            &mut ready_driver_events,
+                            evt,
+                            &mut driver_event_rx,
+                        );
+                        let is_closed = self.handle_driver_events(&mut ready_driver_events).await;
                         if is_closed {
                             trace!("Driver event channel closed, exiting event loop");
                             return Ok(());
@@ -858,6 +891,59 @@ where
         }
     }
 
+    /// Handles one bounded FIFO batch of driver events.
+    ///
+    /// Contiguous prepared-RTP events share one core lock. Other event kinds
+    /// retain their original FIFO handling and form an explicit fairness boundary.
+    async fn handle_driver_events(&mut self, events: &mut Vec<PeerConnectionDriverEvent>) -> bool {
+        let mut events = events.drain(..).peekable();
+
+        while let Some(event) = events.next() {
+            let PeerConnectionDriverEvent::SenderRtpPrepared {
+                sender_id,
+                packet,
+                ssrc,
+                payload_type,
+            } = event
+            else {
+                if self.handle_driver_event(event).await {
+                    return true;
+                }
+                continue;
+            };
+
+            let mut core = self.inner.core.lock().await;
+            let mut write_prepared = |sender_id, mut packet: rtp::Packet, ssrc, payload_type| {
+                packet.header.ssrc = ssrc;
+                packet.header.payload_type = payload_type;
+                if let Err(err) = core.write_rtp_packet(packet) {
+                    error!(
+                        "Failed to send prepared RTP for sender {:?}: {}",
+                        sender_id, err
+                    );
+                }
+            };
+            write_prepared(sender_id, packet, ssrc, payload_type);
+
+            while events.peek().is_some_and(|event| {
+                matches!(event, PeerConnectionDriverEvent::SenderRtpPrepared { .. })
+            }) {
+                let Some(PeerConnectionDriverEvent::SenderRtpPrepared {
+                    sender_id,
+                    packet,
+                    ssrc,
+                    payload_type,
+                }) = events.next()
+                else {
+                    unreachable!("prepared RTP event should match the peeked event");
+                };
+                write_prepared(sender_id, packet, ssrc, payload_type);
+            }
+        }
+
+        false
+    }
+
     async fn handle_driver_event(&mut self, evt: PeerConnectionDriverEvent) -> bool {
         match evt {
             PeerConnectionDriverEvent::SenderRtp(sender_id, packet) => {
@@ -1181,5 +1267,74 @@ where
         let mut core = self.inner.core.lock().await;
         core.handle_timeout(now)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::channel;
+
+    fn prepared_rtp(sequence_number: u16) -> PeerConnectionDriverEvent {
+        PeerConnectionDriverEvent::SenderRtpPrepared {
+            sender_id: RTCRtpSenderId::default(),
+            packet: rtp::Packet {
+                header: rtp::header::Header {
+                    sequence_number,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ssrc: 0x1112_1314,
+            payload_type: 96,
+        }
+    }
+
+    fn prepared_sequence_number(event: &PeerConnectionDriverEvent) -> u16 {
+        let PeerConnectionDriverEvent::SenderRtpPrepared { packet, .. } = event else {
+            panic!("expected prepared RTP event");
+        };
+        packet.header.sequence_number
+    }
+
+    #[test]
+    fn ready_driver_event_batch_preserves_fifo_order_and_bound() {
+        let (tx, mut rx) = channel(DRIVER_EVENT_BATCH_SIZE + 1);
+        for sequence_number in 0..=DRIVER_EVENT_BATCH_SIZE as u16 {
+            tx.try_send(prepared_rtp(sequence_number))
+                .expect("driver event should fit test channel");
+        }
+
+        let first = rx.try_recv().expect("first RTP event should be queued");
+        let mut events = Vec::with_capacity(DRIVER_EVENT_BATCH_SIZE);
+        drain_ready_driver_events(&mut events, first, &mut rx);
+
+        assert_eq!(events.len(), DRIVER_EVENT_BATCH_SIZE);
+        for (expected, event) in events.iter().enumerate() {
+            assert_eq!(prepared_sequence_number(event), expected as u16);
+        }
+        assert_eq!(
+            prepared_sequence_number(&rx.try_recv().expect("one event should remain queued")),
+            DRIVER_EVENT_BATCH_SIZE as u16
+        );
+    }
+
+    #[test]
+    fn ready_driver_event_batch_keeps_control_events_between_rtp_runs() {
+        let (tx, mut rx) = channel(3);
+        tx.try_send(prepared_rtp(1))
+            .expect("first RTP event should fit test channel");
+        tx.try_send(PeerConnectionDriverEvent::WriteNotify)
+            .expect("control event should fit test channel");
+        tx.try_send(prepared_rtp(2))
+            .expect("second RTP event should fit test channel");
+
+        let first = rx.try_recv().expect("first RTP event should be queued");
+        let mut events = Vec::with_capacity(DRIVER_EVENT_BATCH_SIZE);
+        drain_ready_driver_events(&mut events, first, &mut rx);
+
+        assert_eq!(prepared_sequence_number(&events[0]), 1);
+        assert!(matches!(events[1], PeerConnectionDriverEvent::WriteNotify));
+        assert_eq!(prepared_sequence_number(&events[2]), 2);
     }
 }
