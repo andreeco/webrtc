@@ -95,6 +95,12 @@ pub(crate) enum PeerConnectionDriverEvent {
         ssrc: SSRC,
         payload_type: PayloadType,
     },
+    SenderRtpPreparedBatch {
+        sender_id: RTCRtpSenderId,
+        packets: Vec<rtp::Packet>,
+        ssrc: SSRC,
+        payload_type: PayloadType,
+    },
     SenderRtcp(RTCRtpSenderId, Vec<Box<dyn rtcp::Packet>>),
     ReceiverRtcp(RTCRtpReceiverId, Vec<Box<dyn rtcp::Packet>>),
     RemoteIceTcpPassiveCandidate(Candidate),
@@ -899,49 +905,68 @@ where
         let mut events = events.drain(..).peekable();
 
         while let Some(event) = events.next() {
-            let PeerConnectionDriverEvent::SenderRtpPrepared {
-                sender_id,
-                packet,
-                ssrc,
-                payload_type,
-            } = event
-            else {
+            if !Self::is_prepared_rtp_event(&event) {
                 if self.handle_driver_event(event).await {
                     return true;
                 }
                 continue;
-            };
+            }
 
             let mut core = self.inner.core.lock().await;
-            let mut write_prepared = |sender_id, mut packet: rtp::Packet, ssrc, payload_type| {
-                packet.header.ssrc = ssrc;
-                packet.header.payload_type = payload_type;
-                if let Err(err) = core.write_rtp_packet(packet) {
-                    error!(
-                        "Failed to send prepared RTP for sender {:?}: {}",
-                        sender_id, err
-                    );
-                }
-            };
-            write_prepared(sender_id, packet, ssrc, payload_type);
-
-            while events.peek().is_some_and(|event| {
-                matches!(event, PeerConnectionDriverEvent::SenderRtpPrepared { .. })
-            }) {
-                let Some(PeerConnectionDriverEvent::SenderRtpPrepared {
-                    sender_id,
-                    packet,
-                    ssrc,
-                    payload_type,
-                }) = events.next()
-                else {
-                    unreachable!("prepared RTP event should match the peeked event");
-                };
-                write_prepared(sender_id, packet, ssrc, payload_type);
+            Self::write_prepared_rtp_event(&mut core, event);
+            while events.peek().is_some_and(Self::is_prepared_rtp_event) {
+                let event = events
+                    .next()
+                    .expect("prepared RTP event should follow the peeked event");
+                Self::write_prepared_rtp_event(&mut core, event);
             }
         }
 
         false
+    }
+
+    fn is_prepared_rtp_event(event: &PeerConnectionDriverEvent) -> bool {
+        matches!(
+            event,
+            PeerConnectionDriverEvent::SenderRtpPrepared { .. }
+                | PeerConnectionDriverEvent::SenderRtpPreparedBatch { .. }
+        )
+    }
+
+    fn write_prepared_rtp_event(
+        core: &mut rtc::peer_connection::RTCPeerConnection<I>,
+        event: PeerConnectionDriverEvent,
+    ) {
+        let mut write_packet = |sender_id, mut packet: rtp::Packet, ssrc, payload_type| {
+            packet.header.ssrc = ssrc;
+            packet.header.payload_type = payload_type;
+            if let Err(err) = core.write_rtp_packet(packet) {
+                error!(
+                    "Failed to send prepared RTP for sender {:?}: {}",
+                    sender_id, err
+                );
+            }
+        };
+
+        match event {
+            PeerConnectionDriverEvent::SenderRtpPrepared {
+                sender_id,
+                packet,
+                ssrc,
+                payload_type,
+            } => write_packet(sender_id, packet, ssrc, payload_type),
+            PeerConnectionDriverEvent::SenderRtpPreparedBatch {
+                sender_id,
+                packets,
+                ssrc,
+                payload_type,
+            } => {
+                for packet in packets {
+                    write_packet(sender_id, packet, ssrc, payload_type);
+                }
+            }
+            _ => unreachable!("only prepared RTP events are passed to this helper"),
+        }
     }
 
     async fn handle_driver_event(&mut self, evt: PeerConnectionDriverEvent) -> bool {
@@ -959,21 +984,10 @@ where
                     );
                 }
             }
-            PeerConnectionDriverEvent::SenderRtpPrepared {
-                sender_id,
-                mut packet,
-                ssrc,
-                payload_type,
-            } => {
+            event @ (PeerConnectionDriverEvent::SenderRtpPrepared { .. }
+            | PeerConnectionDriverEvent::SenderRtpPreparedBatch { .. }) => {
                 let mut core = self.inner.core.lock().await;
-                packet.header.ssrc = ssrc;
-                packet.header.payload_type = payload_type;
-                if let Err(err) = core.write_rtp_packet(packet) {
-                    error!(
-                        "Failed to send prepared RTP for sender {:?}: {}",
-                        sender_id, err
-                    );
-                }
+                Self::write_prepared_rtp_event(&mut core, event);
             }
             PeerConnectionDriverEvent::SenderRtcp(sender_id, rtcp_packets) => {
                 let mut core = self.inner.core.lock().await;
@@ -1297,6 +1311,35 @@ mod tests {
         packet.header.sequence_number
     }
 
+    fn prepared_rtp_batch(sequence_numbers: &[u16]) -> PeerConnectionDriverEvent {
+        PeerConnectionDriverEvent::SenderRtpPreparedBatch {
+            sender_id: RTCRtpSenderId::default(),
+            packets: sequence_numbers
+                .iter()
+                .copied()
+                .map(|sequence_number| rtp::Packet {
+                    header: rtp::header::Header {
+                        sequence_number,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ssrc: 0x1112_1314,
+            payload_type: 96,
+        }
+    }
+
+    fn prepared_batch_sequence_numbers(event: &PeerConnectionDriverEvent) -> Vec<u16> {
+        let PeerConnectionDriverEvent::SenderRtpPreparedBatch { packets, .. } = event else {
+            panic!("expected prepared RTP batch event");
+        };
+        packets
+            .iter()
+            .map(|packet| packet.header.sequence_number)
+            .collect()
+    }
+
     #[test]
     fn ready_driver_event_batch_preserves_fifo_order_and_bound() {
         let (tx, mut rx) = channel(DRIVER_EVENT_BATCH_SIZE + 1);
@@ -1320,6 +1363,16 @@ mod tests {
     }
 
     #[test]
+    fn ready_driver_event_batch_preserves_prepared_rtp_batch_fifo() {
+        let (tx, mut rx) = channel(1);
+        tx.try_send(prepared_rtp_batch(&[1, 2, 3]))
+            .expect("prepared RTP batch should fit test channel");
+
+        let first = rx.try_recv().expect("prepared RTP batch should be queued");
+        assert_eq!(prepared_batch_sequence_numbers(&first), vec![1, 2, 3]);
+    }
+
+    #[test]
     fn ready_driver_event_batch_keeps_control_events_between_rtp_runs() {
         let (tx, mut rx) = channel(3);
         tx.try_send(prepared_rtp(1))
@@ -1336,5 +1389,24 @@ mod tests {
         assert_eq!(prepared_sequence_number(&events[0]), 1);
         assert!(matches!(events[1], PeerConnectionDriverEvent::WriteNotify));
         assert_eq!(prepared_sequence_number(&events[2]), 2);
+    }
+
+    #[test]
+    fn ready_driver_event_batch_keeps_control_event_between_prepared_rtp_batches() {
+        let (tx, mut rx) = channel(3);
+        tx.try_send(prepared_rtp_batch(&[1, 2]))
+            .expect("first RTP batch should fit test channel");
+        tx.try_send(PeerConnectionDriverEvent::WriteNotify)
+            .expect("control event should fit test channel");
+        tx.try_send(prepared_rtp_batch(&[3, 4]))
+            .expect("second RTP batch should fit test channel");
+
+        let first = rx.try_recv().expect("first driver event should be queued");
+        let mut events = Vec::with_capacity(DRIVER_EVENT_BATCH_SIZE);
+        drain_ready_driver_events(&mut events, first, &mut rx);
+
+        assert_eq!(prepared_batch_sequence_numbers(&events[0]), vec![1, 2]);
+        assert!(matches!(events[1], PeerConnectionDriverEvent::WriteNotify));
+        assert_eq!(prepared_batch_sequence_numbers(&events[2]), vec![3, 4]);
     }
 }

@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use crate::media_stream::Track;
 use crate::media_stream::track_local::{TrackLocal, TrackLocalContext, TrackLocalEvent};
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
-use crate::runtime::{Mutex, Receiver};
+use crate::runtime::{Mutex, Receiver, SendError, Sender, TrySendError};
 use bytes::{Bytes, BytesMut};
 use rtc::media_stream::{
     MediaStreamId, MediaStreamTrack, MediaStreamTrackId, MediaStreamTrackState,
@@ -16,6 +16,8 @@ use rtc::{rtcp, rtp};
 use std::collections::HashMap;
 
 const SDES_MID_URI: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
+/// Maximum RTP packets accepted by one prepared-RTP driver event.
+const MAX_PREPARED_RTP_BATCH_SIZE: usize = 64;
 
 /// Outcome of binding a static RTP track to a negotiated sender context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +139,70 @@ impl TrackLocalStaticRTP {
         .await
     }
 
+    /// Writes a bounded RTP batch with the SDES MID extension using a reusable MID byte buffer.
+    ///
+    /// The caller retains control of the batch allocation. Each packet is prepared in order and
+    /// enters the bounded driver channel as one event, preserving its position relative to control
+    /// events already queued on that channel.
+    pub async fn write_rtp_batch_with_sdes_mid_bytes(
+        &self,
+        mut packets: Vec<rtp::Packet>,
+        mid: Bytes,
+        preserve_existing_extensions: bool,
+    ) -> Result<()> {
+        if packets.len() > MAX_PREPARED_RTP_BATCH_SIZE {
+            return Err(Error::Other(format!(
+                "prepared RTP batch exceeds maximum of {MAX_PREPARED_RTP_BATCH_SIZE} packets"
+            )));
+        }
+        if packets.is_empty() {
+            return Ok(());
+        }
+
+        let (tx, mid_ext_id, prepared_rtp) = {
+            let ctx = self.ctx.lock().await;
+            let Some(ctx) = &*ctx else {
+                return Err(Error::ErrBindFailed);
+            };
+            (
+                ctx.context.driver_event_tx.clone(),
+                ctx.mid_extension_id,
+                ctx.context.prepared_rtp.clone(),
+            )
+        };
+        let Some(prepared) = prepared_rtp else {
+            return Err(Error::Other(
+                "prepared RTP batch requires a compatible sender binding".to_owned(),
+            ));
+        };
+
+        for packet in &mut packets {
+            if !preserve_existing_extensions {
+                packet.header.extension = false;
+                packet.header.extension_profile = 0;
+                packet.header.extensions.clear();
+                packet.header.extensions_padding = 0;
+            }
+            if let Some(id) = mid_ext_id {
+                packet
+                    .header
+                    .set_extension(id, mid.clone())
+                    .map_err(|e| Error::Other(format!("{e:?}")))?;
+            }
+        }
+
+        Self::send_driver_event(
+            &tx,
+            PeerConnectionDriverEvent::SenderRtpPreparedBatch {
+                sender_id: prepared.rtp_sender_id,
+                packets,
+                ssrc: prepared.ssrc,
+                payload_type: prepared.payload_type,
+            },
+        )
+        .await
+    }
+
     /// Writes an RTP packet with SDES MID extension using a reusable MID byte buffer.
     pub async fn write_rtp_with_sdes_mid_bytes(
         &self,
@@ -181,9 +247,23 @@ impl TrackLocalStaticRTP {
             PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, pkt)
         };
 
-        tx.send(event)
-            .await
-            .map_err(|e| Error::Other(format!("{:?}", e)))
+        Self::send_driver_event(&tx, event).await
+    }
+
+    async fn send_driver_event(
+        tx: &Sender<PeerConnectionDriverEvent>,
+        event: PeerConnectionDriverEvent,
+    ) -> Result<()> {
+        match tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event)) => tx
+                .send(event)
+                .await
+                .map_err(|e| Error::Other(format!("{e:?}"))),
+            Err(TrySendError::Disconnected(event)) => {
+                Err(Error::Other(format!("{:?}", SendError(event))))
+            }
+        }
     }
 }
 
@@ -341,9 +421,7 @@ impl TrackLocal for TrackLocalStaticRTP {
             } else {
                 PeerConnectionDriverEvent::SenderRtp(rtp_sender_id, packet)
             };
-            tx.send(event)
-                .await
-                .map_err(|e| Error::Other(format!("{:?}", e)))
+            Self::send_driver_event(&tx, event).await
         } else {
             Err(Error::Other("track is not binding yet".to_string()))
         }
@@ -441,7 +519,16 @@ mod tests {
         sender_id: RTCRtpSenderId,
         mid_extension_id: u16,
     ) -> crate::runtime::Receiver<PeerConnectionDriverEvent> {
-        let (driver_event_tx, driver_event_rx) = channel(2);
+        bind_with_capacity(track, sender_id, mid_extension_id, 2).await
+    }
+
+    async fn bind_with_capacity(
+        track: &TrackLocalStaticRTP,
+        sender_id: RTCRtpSenderId,
+        mid_extension_id: u16,
+        capacity: usize,
+    ) -> crate::runtime::Receiver<PeerConnectionDriverEvent> {
+        let (driver_event_tx, driver_event_rx) = channel(capacity);
         let (_event_tx, event_rx) = channel(1);
         track
             .bind(
@@ -458,6 +545,87 @@ mod tests {
             | PeerConnectionDriverEvent::SenderRtp(_, packet) => packet,
             event => panic!("expected RTP event, got {event:?}"),
         }
+    }
+
+    fn prepared_batch_packets(event: PeerConnectionDriverEvent) -> Vec<Packet> {
+        let PeerConnectionDriverEvent::SenderRtpPreparedBatch { packets, .. } = event else {
+            panic!("expected prepared RTP batch event");
+        };
+        packets
+    }
+
+    #[test]
+    fn sdes_mid_write_falls_back_to_awaited_send_when_driver_channel_is_full() {
+        block_on(async {
+            let track = track();
+            let mut events = bind_with_capacity(&track, RTCRtpSenderId::default(), 4, 1).await;
+            track
+                .write_rtp_with_sdes_mid(packet(), b"a", false)
+                .await
+                .expect("first MID write should fill the driver channel");
+
+            let write = track.write_rtp_with_sdes_mid(packet(), b"b", false);
+            let receive = async {
+                let first = sender_packet(events.recv().await.expect("first RTP event"));
+                let second = sender_packet(events.recv().await.expect("second RTP event"));
+                (first, second)
+            };
+            let (result, (first, second)) = futures::join!(write, receive);
+
+            result.expect("full-channel fallback should eventually deliver RTP");
+            assert_eq!(first.header.extensions[0].payload, Bytes::from_static(b"a"));
+            assert_eq!(
+                second.header.extensions[0].payload,
+                Bytes::from_static(b"b")
+            );
+        });
+    }
+
+    #[test]
+    fn sdes_mid_batch_write_preserves_packet_fifo_and_injects_cached_mid() {
+        block_on(async {
+            let track = track();
+            let mut events = bind(&track, RTCRtpSenderId::default(), 4).await;
+            let mut first = packet();
+            first.header.sequence_number = 1;
+            let mut second = packet();
+            second.header.sequence_number = 2;
+
+            track
+                .write_rtp_batch_with_sdes_mid_bytes(
+                    vec![first, second],
+                    Bytes::from_static(b"mid"),
+                    false,
+                )
+                .await
+                .expect("batch write should queue prepared RTP");
+
+            let packets = prepared_batch_packets(events.recv().await.expect("prepared RTP batch"));
+            assert_eq!(packets.len(), 2);
+            assert_eq!(packets[0].header.sequence_number, 1);
+            assert_eq!(packets[1].header.sequence_number, 2);
+            assert_eq!(packets[0].header.extensions[0].id, 4);
+            assert_eq!(
+                packets[1].header.extensions[0].payload,
+                Bytes::from_static(b"mid")
+            );
+        });
+    }
+
+    #[test]
+    fn sdes_mid_batch_write_rejects_more_than_the_bounded_batch_size() {
+        block_on(async {
+            let track = track();
+            let _events = bind(&track, RTCRtpSenderId::default(), 4).await;
+            let packets = vec![packet(); MAX_PREPARED_RTP_BATCH_SIZE + 1];
+
+            assert!(
+                track
+                    .write_rtp_batch_with_sdes_mid_bytes(packets, Bytes::from_static(b"mid"), false)
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     #[test]
