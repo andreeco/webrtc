@@ -31,6 +31,7 @@ pub(crate) type TcpAcceptResult = (
 
 pub(crate) struct RTCTcpTransport {
     listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>,
+    candidate_addrs: Vec<SocketAddr>,
     streams: HashMap<FourTuple, Arc<dyn AsyncTcpStream>>,
     decoders: HashMap<FourTuple, TcpFrameDecoder>,
     pub(crate) accept_futures: FuturesUnordered<BoxFuture<'static, TcpAcceptResult>>,
@@ -38,7 +39,10 @@ pub(crate) struct RTCTcpTransport {
 }
 
 impl RTCTcpTransport {
-    pub(crate) fn new(tcp_listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>) -> Self {
+    pub(crate) fn new(
+        tcp_listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>,
+        tcp_candidate_addrs: Vec<SocketAddr>,
+    ) -> Self {
         let accept_futures = FuturesUnordered::new();
         for (local_addr, listener) in &tcp_listeners {
             let local_addr = *local_addr;
@@ -54,8 +58,16 @@ impl RTCTcpTransport {
             );
         }
 
+        let mut candidate_addrs = tcp_listeners.keys().copied().collect::<Vec<_>>();
+        for addr in tcp_candidate_addrs {
+            if !candidate_addrs.contains(&addr) {
+                candidate_addrs.push(addr);
+            }
+        }
+
         Self {
             listeners: tcp_listeners,
+            candidate_addrs,
             streams: HashMap::new(),
             decoders: HashMap::new(),
             accept_futures,
@@ -64,7 +76,7 @@ impl RTCTcpTransport {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.listeners.is_empty()
+        self.listeners.is_empty() && self.candidate_addrs.is_empty()
     }
 
     pub(crate) fn listener_count(&self) -> usize {
@@ -231,7 +243,7 @@ impl RTCTcpTransport {
 
     pub(crate) fn gather_candidates(&self) -> Vec<RTCIceCandidateInit> {
         let mut candidates = Vec::new();
-        for local_addr in self.listeners.keys() {
+        for local_addr in &self.candidate_addrs {
             // Gather passive TCP candidate
             let passive_config = CandidateHostConfig {
                 base_config: CandidateConfig {
@@ -293,9 +305,11 @@ impl RTCTcpTransport {
                             peer_addr,
                         };
                         let _ = tx
-                            .send(PeerConnectionDriverEvent::IncomingTcpStream(
-                                four_tuple, stream,
-                            ))
+                            .send(PeerConnectionDriverEvent::IncomingTcpStream {
+                                four_tuple,
+                                stream,
+                                initial_packet: None,
+                            })
                             .await;
                     }
                     Err(err) => {

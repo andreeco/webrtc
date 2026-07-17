@@ -14,6 +14,7 @@ use rtc::turn::proto::relayaddr::RelayedAddress;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use webrtc::data_channel::DataChannelEvent;
 use webrtc::peer_connection::*;
 use webrtc::peer_connection::{
     MediaEngine, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceCandidateType,
@@ -21,7 +22,7 @@ use webrtc::peer_connection::{
     RTCPeerConnectionState,
 };
 use webrtc::runtime::{AsyncUdpSocket, default_runtime, timeout};
-use webrtc::runtime::{Mutex, Sender};
+use webrtc::runtime::{Mutex, Receiver, Sender};
 use webrtc::runtime::{block_on, channel};
 
 #[derive(Clone)]
@@ -558,7 +559,7 @@ fn test_turn_relay_gathering_with_mock_turn_server() {
 }
 
 #[test]
-fn test_ice_tcp_only_connection() {
+fn test_ice_tcp_only_connection_over_shared_fixed_port_mux() {
     block_on(async {
         env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
@@ -568,11 +569,18 @@ fn test_ice_tcp_only_connection() {
 
         let runtime = default_runtime().expect("no async runtime found");
 
-        let (a_candidate_tx, mut a_candidate_rx) = channel::<RTCIceCandidateInit>(32);
-        let (b_candidate_tx, mut b_candidate_rx) = channel::<RTCIceCandidateInit>(32);
+        let (a_candidate_tx, a_candidate_rx) = channel::<RTCIceCandidateInit>(32);
+        let (b_candidate_tx, b_candidate_rx) = channel::<RTCIceCandidateInit>(32);
+        let (c_candidate_tx, c_candidate_rx) = channel::<RTCIceCandidateInit>(32);
+        let (d_candidate_tx, d_candidate_rx) = channel::<RTCIceCandidateInit>(32);
+
+        let tcp_mux =
+            TcpMux::bind(runtime.clone(), "127.0.0.1:0").expect("failed to bind shared TCP mux");
 
         let (a_connected_tx, mut a_connected_rx) = channel::<()>(1);
         let (b_connected_tx, mut b_connected_rx) = channel::<()>(1);
+        let (c_connected_tx, mut c_connected_rx) = channel::<()>(1);
+        let (d_connected_tx, mut d_connected_rx) = channel::<()>(1);
 
         struct TestHandler {
             candidate_tx: Sender<RTCIceCandidateInit>,
@@ -604,7 +612,7 @@ fn test_ice_tcp_only_connection() {
                 candidate_tx: a_candidate_tx,
                 connected_tx: a_connected_tx,
             }))
-            .with_tcp_addrs(vec!["127.0.0.1:0"])
+            .with_tcp_mux(tcp_mux.clone())
             .with_udp_addrs(Vec::<&str>::new()) // Force TCP only
             .build()
             .await
@@ -619,49 +627,101 @@ fn test_ice_tcp_only_connection() {
                 candidate_tx: b_candidate_tx,
                 connected_tx: b_connected_tx,
             }))
-            .with_tcp_addrs(vec!["127.0.0.1:0"])
+            .with_tcp_mux(tcp_mux.clone())
             .with_udp_addrs(Vec::<&str>::new()) // Force TCP only
             .build()
             .await
             .unwrap();
         let pc_b = Arc::new(pc_b);
 
-        // Create data channel to ensure DTLS/SCTP handshakes happen
-        let _dc_a = pc_a.create_data_channel("test-tcp", None).await.unwrap();
+        let mut media_engine_c = MediaEngine::default();
+        media_engine_c.register_default_codecs().unwrap();
+        let pc_c = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_media_engine(media_engine_c)
+                .with_handler(Arc::new(TestHandler {
+                    candidate_tx: c_candidate_tx,
+                    connected_tx: c_connected_tx,
+                }))
+                .with_tcp_addrs(vec!["127.0.0.1:0"])
+                .with_udp_addrs(Vec::<&str>::new())
+                .build()
+                .await
+                .unwrap(),
+        );
 
-        let offer = pc_a.create_offer(None).await.unwrap();
-        pc_a.set_local_description(offer.clone()).await.unwrap();
-        pc_b.set_remote_description(offer).await.unwrap();
+        let mut media_engine_d = MediaEngine::default();
+        media_engine_d.register_default_codecs().unwrap();
+        let pc_d = Arc::new(
+            PeerConnectionBuilder::new()
+                .with_media_engine(media_engine_d)
+                .with_handler(Arc::new(TestHandler {
+                    candidate_tx: d_candidate_tx,
+                    connected_tx: d_connected_tx,
+                }))
+                .with_tcp_addrs(vec!["127.0.0.1:0"])
+                .with_udp_addrs(Vec::<&str>::new())
+                .build()
+                .await
+                .unwrap(),
+        );
 
-        let answer = pc_b.create_answer(None).await.unwrap();
-        pc_b.set_local_description(answer.clone()).await.unwrap();
-        pc_a.set_remote_description(answer).await.unwrap();
+        let _dc_a = pc_a
+            .create_data_channel("shared-tcp-a", None)
+            .await
+            .unwrap();
+        let _dc_b = pc_b
+            .create_data_channel("shared-tcp-b", None)
+            .await
+            .unwrap();
 
-        // Relay candidates in background tasks
-        let pc_a_clone = pc_a.clone();
-        let pc_b_clone = pc_b.clone();
+        let offer_a = pc_a.create_offer(None).await.unwrap();
+        pc_a.set_local_description(offer_a.clone()).await.unwrap();
+        pc_c.set_remote_description(offer_a).await.unwrap();
+        let answer_c = pc_c.create_answer(None).await.unwrap();
+        pc_c.set_local_description(answer_c.clone()).await.unwrap();
+        pc_a.set_remote_description(answer_c).await.unwrap();
 
-        let task_a = runtime.spawn(Box::pin(async move {
-            while let Some(cand) = a_candidate_rx.recv().await {
-                let _ = pc_b_clone.add_ice_candidate(cand).await;
-            }
-        }));
+        let offer_b = pc_b.create_offer(None).await.unwrap();
+        pc_b.set_local_description(offer_b.clone()).await.unwrap();
+        pc_d.set_remote_description(offer_b).await.unwrap();
+        let answer_d = pc_d.create_answer(None).await.unwrap();
+        pc_d.set_local_description(answer_d.clone()).await.unwrap();
+        pc_b.set_remote_description(answer_d).await.unwrap();
 
-        let task_b = runtime.spawn(Box::pin(async move {
-            while let Some(cand) = b_candidate_rx.recv().await {
-                let _ = pc_a_clone.add_ice_candidate(cand).await;
-            }
-        }));
+        let forward = |mut candidates: Receiver<RTCIceCandidateInit>,
+                       target: Arc<dyn PeerConnection>| {
+            runtime.spawn(Box::pin(async move {
+                while let Some(candidate) = candidates.recv().await {
+                    let _ = target.add_ice_candidate(candidate).await;
+                }
+            }))
+        };
+        let task_a = forward(a_candidate_rx, pc_c.clone());
+        let task_c = forward(c_candidate_rx, pc_a.clone());
+        let task_b = forward(b_candidate_rx, pc_d.clone());
+        let task_d = forward(d_candidate_rx, pc_b.clone());
 
-        // Wait for connection
         timeout(Duration::from_secs(10), async {
             let _ = a_connected_rx.recv().await;
             let _ = b_connected_rx.recv().await;
+            let _ = c_connected_rx.recv().await;
+            let _ = d_connected_rx.recv().await;
         })
         .await
-        .expect("Timed out waiting for TCP PeerConnection connection to establish");
+        .expect("Timed out waiting for shared TCP mux peer connections to establish");
+
+        for data_channel in [&_dc_a, &_dc_b] {
+            timeout(Duration::from_secs(5), async {
+                while !matches!(data_channel.poll().await, Some(DataChannelEvent::OnOpen)) {}
+            })
+            .await
+            .expect("timed out waiting for shared TCP mux data channel to open");
+        }
 
         task_a.abort();
         task_b.abort();
+        task_c.abort();
+        task_d.abort();
     });
 }

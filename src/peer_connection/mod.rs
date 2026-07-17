@@ -50,6 +50,7 @@
 //! ```
 
 pub(crate) mod driver;
+pub mod tcp_mux;
 pub(crate) mod transports;
 
 use log::error;
@@ -90,6 +91,8 @@ use crate::media_stream::track_local::TrackLocalEvent;
 use crate::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use crate::media_stream::track_remote::TrackRemoteEvent;
 use crate::peer_connection::driver::PeerConnectionDriverEvent;
+pub use crate::peer_connection::tcp_mux::TcpMux;
+use crate::peer_connection::tcp_mux::TcpMuxRegistration;
 use crate::rtp_transceiver::rtp_sender::RtpSenderImpl;
 pub use rtc::interceptor::{Interceptor, NoopInterceptor, Registry};
 use rtc::media_stream::MediaStreamTrackId;
@@ -178,6 +181,7 @@ where
     data_channels_detached: bool,
     udp_addrs: Vec<A>,
     tcp_addrs: Vec<A>,
+    tcp_mux: Option<TcpMux>,
     dedicated_reactor: bool,
 }
 
@@ -191,6 +195,7 @@ impl<A: ToSocketAddrs> Default for PeerConnectionBuilder<A, NoopInterceptor> {
             data_channels_detached: false,
             udp_addrs: vec![],
             tcp_addrs: vec![],
+            tcp_mux: None,
             dedicated_reactor: false,
         }
     }
@@ -243,6 +248,7 @@ where
             data_channels_detached: self.data_channels_detached,
             udp_addrs: self.udp_addrs,
             tcp_addrs: self.tcp_addrs,
+            tcp_mux: self.tcp_mux,
             dedicated_reactor: self.dedicated_reactor,
         }
     }
@@ -268,6 +274,15 @@ where
     /// Configures the builder with the local TCP socket addresses to bind.
     pub fn with_tcp_addrs(mut self, tcp_addrs: Vec<A>) -> Self {
         self.tcp_addrs = tcp_addrs;
+        self
+    }
+
+    /// Configures the builder to publish and accept ICE/TCP through a shared [`TcpMux`].
+    ///
+    /// The mux remains open when this peer connection closes; only this peer's
+    /// ICE credential route is removed.
+    pub fn with_tcp_mux(mut self, tcp_mux: TcpMux) -> Self {
+        self.tcp_mux = Some(tcp_mux);
         self
     }
 
@@ -314,6 +329,7 @@ where
             self.data_channels_detached,
             self.udp_addrs,
             self.tcp_addrs,
+            self.tcp_mux,
             self.dedicated_reactor,
         )
         .await
@@ -432,6 +448,8 @@ where
 {
     inner: Arc<PeerConnectionRef<I>>,
     driver_handle: Mutex<Option<JoinHandle>>,
+    tcp_mux: Option<TcpMux>,
+    tcp_mux_registration: std::sync::Mutex<Option<TcpMuxRegistration>>,
     /// Whether the driver runs on a dedicated reactor thread. When true, `close()`
     /// waits for that thread to finish, and `Drop` signals it to stop (via
     /// [`PeerConnectionRef::closing`]) so it does not leak if the connection is
@@ -550,6 +568,7 @@ where
         data_channels_detached: bool,
         udp_addrs: Vec<A>,
         tcp_addrs: Vec<A>,
+        tcp_mux: Option<TcpMux>,
         dedicated_reactor: bool,
     ) -> Result<Self> {
         // Bind the std sockets up front (synchronous, and needed to compute the
@@ -580,6 +599,11 @@ where
             std_tcp_listeners.push((local_addr, listener));
         }
 
+        let tcp_mux_candidate_addrs = tcp_mux
+            .as_ref()
+            .map(|mux| vec![mux.local_addr()])
+            .unwrap_or_default();
+
         let configuration = core.get_configuration();
         let ice_servers = configuration.ice_servers().to_vec();
         let ice_gather_policy = configuration.ice_transport_policy();
@@ -604,6 +628,8 @@ where
                 data_channels_detached,
             }),
             driver_handle: Mutex::new(None),
+            tcp_mux,
+            tcp_mux_registration: std::sync::Mutex::new(None),
             dedicated_reactor,
         };
 
@@ -652,6 +678,7 @@ where
                     async_mdns_socket,
                     async_udp_sockets,
                     async_tcp_listeners,
+                    tcp_mux_candidate_addrs,
                 )
                 .await
             }
@@ -699,6 +726,9 @@ where
     I: Interceptor,
 {
     fn drop(&mut self) {
+        if let Ok(mut registration) = self.tcp_mux_registration.lock() {
+            let _ = registration.take();
+        }
         // A dedicated reactor thread only exits when its event loop returns, so
         // a connection dropped without an explicit `close()` would leak the
         // thread. Set the shutdown flag (infallible) so the driver stops at the
@@ -724,6 +754,9 @@ where
     I: Interceptor + 'static,
 {
     async fn close(&self) -> Result<()> {
+        if let Ok(mut registration) = self.tcp_mux_registration.lock() {
+            let _ = registration.take();
+        }
         {
             let mut core = self.inner.core.lock().await;
             core.close()?;
@@ -789,9 +822,28 @@ where
     }
 
     async fn set_local_description(&self, desc: RTCSessionDescription) -> Result<()> {
+        let tcp_mux_ufrag = self.tcp_mux.as_ref().and_then(|_| {
+            desc.sdp
+                .lines()
+                .find_map(|line| line.strip_prefix("a=ice-ufrag:"))
+                .map(str::to_owned)
+        });
         {
             let mut core = self.inner.core.lock().await;
             core.set_local_description(desc)?;
+        }
+        if let (Some(tcp_mux), Some(ufrag)) = (&self.tcp_mux, tcp_mux_ufrag) {
+            let mut previous = self
+                .tcp_mux_registration
+                .lock()
+                .map_err(|_| Error::Other("TCP mux registration lock poisoned".to_owned()))?;
+            if previous
+                .as_ref()
+                .is_none_or(|registration| registration.ufrag() != ufrag)
+            {
+                let registration = tcp_mux.register(ufrag, self.inner.driver_event_tx.clone())?;
+                *previous = Some(registration);
+            }
         }
 
         // Wake the driver with MessageInner::IceGathering. Without this

@@ -86,7 +86,6 @@ fn drain_ready_driver_events(
 }
 
 /// Unified inner message type for the peer connection driver
-#[derive(Debug)]
 pub(crate) enum PeerConnectionDriverEvent {
     SenderRtp(RTCRtpSenderId, rtp::Packet),
     SenderRtpPrepared {
@@ -104,10 +103,20 @@ pub(crate) enum PeerConnectionDriverEvent {
     SenderRtcp(RTCRtpSenderId, Vec<Box<dyn rtcp::Packet>>),
     ReceiverRtcp(RTCRtpReceiverId, Vec<Box<dyn rtcp::Packet>>),
     RemoteIceTcpPassiveCandidate(Candidate),
-    IncomingTcpStream(FourTuple, Arc<dyn AsyncTcpStream>),
+    IncomingTcpStream {
+        four_tuple: FourTuple,
+        stream: Arc<dyn AsyncTcpStream>,
+        initial_packet: Option<TaggedBytesMut>,
+    },
     WriteNotify,
     IceGathering,
     Close,
+}
+
+impl std::fmt::Debug for PeerConnectionDriverEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PeerConnectionDriverEvent")
+    }
 }
 
 /// The driver for a peer connection
@@ -144,8 +153,9 @@ where
         mdns_socket: Option<Arc<dyn AsyncUdpSocket>>,
         udp_sockets: HashMap<SocketAddr, Arc<dyn AsyncUdpSocket>>,
         tcp_listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>,
+        tcp_candidate_addrs: Vec<SocketAddr>,
     ) -> Result<Self> {
-        if udp_sockets.is_empty() && tcp_listeners.is_empty() {
+        if udp_sockets.is_empty() && tcp_listeners.is_empty() && tcp_candidate_addrs.is_empty() {
             return Err(Error::Other("no sockets or listeners available".to_owned()));
         }
 
@@ -155,7 +165,7 @@ where
             turn_relayer,
             mdns_socket,
             udp_sockets,
-            tcp_transport: RTCTcpTransport::new(tcp_listeners),
+            tcp_transport: RTCTcpTransport::new(tcp_listeners, tcp_candidate_addrs),
             ice_gathering_active: false,
             stun_gathering_complete: false,
             turn_gathering_complete: false,
@@ -1061,9 +1071,18 @@ where
                     self.inner.driver_event_tx.clone(),
                 );
             }
-            PeerConnectionDriverEvent::IncomingTcpStream(four_tuple, stream) => {
+            PeerConnectionDriverEvent::IncomingTcpStream {
+                four_tuple,
+                stream,
+                initial_packet,
+            } => {
                 trace!("TCP stream connection established: {:?}", four_tuple);
                 self.tcp_transport.register_stream(four_tuple, stream);
+                if let Some(packet) = initial_packet
+                    && let Err(error) = self.handle_read(packet).await
+                {
+                    error!("handle_read error on initial shared TCP frame: {error}");
+                }
             }
             PeerConnectionDriverEvent::Close => {
                 if let Err(err) = self.turn_relayer.close() {
