@@ -133,8 +133,14 @@ fn sender_rtp_survives_single_pc_style_multi_section_renegotiations() {
 
 #[test]
 fn sender_rtp_survives_when_answer_sets_publish_mid_recvonly() {
-    block_on(run_answer_recvonly_publish_mid_test())
+    block_on(run_answer_recvonly_publish_mid_test(false))
         .expect("offerer should continue sending when answer marks publish MID recvonly");
+}
+
+#[test]
+fn publisher_audio_sender_can_be_removed_after_recvonly_answer() {
+    block_on(run_answer_recvonly_publish_mid_test(true))
+        .expect("publisher should create an offer after removing audio sender");
 }
 
 async fn run_test() -> anyhow::Result<()> {
@@ -552,7 +558,7 @@ async fn run_single_pc_style_multi_section_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_answer_recvonly_publish_mid_test() -> anyhow::Result<()> {
+async fn run_answer_recvonly_publish_mid_test(remove_audio_sender: bool) -> anyhow::Result<()> {
     let runtime = default_runtime().ok_or_else(|| std::io::Error::other("no runtime"))?;
     let mut media = MediaEngine::default();
     media.register_default_codecs()?;
@@ -710,6 +716,16 @@ async fn run_answer_recvonly_publish_mid_test() -> anyhow::Result<()> {
         sleep(Duration::from_millis(10)).await;
     }
     wait_for_packets(&receiver_packets, before + 5).await?;
+
+    if remove_audio_sender {
+        offerer.remove_track(&audio_sender).await?;
+        let removal_offer = offerer.create_offer(None).await?;
+        assert!(
+            removal_offer.sdp.contains("m=audio"),
+            "removal offer must retain the negotiated audio media section: {}",
+            removal_offer.sdp
+        );
+    }
 
     offerer.close().await?;
     answerer.close().await?;
